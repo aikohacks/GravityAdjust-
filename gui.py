@@ -43,6 +43,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QSizePolicy,
     QTabWidget,
+    QRadioButton,
+    QButtonGroup,
+    QScrollArea,
 )
 from PySide6.QtGui import QAction, QFont, QKeySequence, QIcon, QDoubleValidator
 from PySide6.QtCore import Qt, QSize
@@ -53,7 +56,7 @@ from matplotlib.figure import Figure
 from core.data_loader import GravityDataLoader, DataLoadError
 from core.drift import DriftCorrector, DriftCorrectionError, format_minutes_to_clock
 from core.line_drift import LineDriftCorrector, LineDriftError
-from reports.excel_export import export_to_excel, ExcelExportError
+from reports.excel_export import export_to_excel, export_drift_only, ExcelExportError
 from reports.pdf_report import export_to_pdf, PdfReportError
 from visualization import graphs
 
@@ -78,6 +81,15 @@ class MainWindow(QMainWindow):
     WINDOW_TITLE = "Gravity Adjustment Software"
     MIN_WIDTH = 1200
     MIN_HEIGHT = 750
+
+    # Table/canvas font. Explicitly NOT "Segoe UI" -- Windows 11's
+    # variable-weight "Segoe UI Variable" font family has a known
+    # Qt/DirectWrite glyph-rendering bug on some systems (observed:
+    # certain letters like "j" rendering as "i", and some button text
+    # rendering fully blank). "Arial" is a safe, universally-available,
+    # non-variable font that sidesteps this entirely. Keep this constant
+    # in sync with the FONT_FAMILY used in main.py's app-wide QFont.
+    FONT_FAMILY = "Arial"
 
     # Maps each graph_type string (used by button/menu actions) to the
     # (tab_index in the inner graphs QTabWidget, plotting function in
@@ -161,6 +173,17 @@ class MainWindow(QMainWindow):
             }
             QFrame {
                 background-color: transparent;
+            }
+
+            QScrollArea {
+                border: none;
+                background-color: #f2f4f7; /* Match QMainWindow background */
+            }
+            QScrollArea > QWidget {
+                background-color: #f2f4f7; /* Ensure content widget also matches */
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #f2f4f7; /* Ensure nested widgets also match */
             }
 
             /* ---------------------------------------------------- */
@@ -260,7 +283,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid #c3c9d1;
                 border-radius: 4px;
                 margin-top: 10px;
-                padding-top: 8px;
+                padding-top: 12px;
+                padding-bottom: 12px;
                 background-color: #ffffff;
                 color: #1a2330;
             }
@@ -350,6 +374,15 @@ class MainWindow(QMainWindow):
             QLineEdit:disabled {
                 background-color: #e6e9ee;
                 color: #8a94a3;
+            }
+
+            /* ---------------------------------------------------- */
+            /* Radio buttons                                        */
+            /* ---------------------------------------------------- */
+            QRadioButton {
+                color: #1a2330;
+                font-weight: 500;
+                spacing: 6px;
             }
 
             /* ---------------------------------------------------- */
@@ -545,37 +578,77 @@ class MainWindow(QMainWindow):
 
     def _build_action_panel(self):
         """Builds the left-hand vertical panel containing all action buttons."""
-        panel = QFrame()
-        panel.setFixedWidth(230)
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(10)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        panel_content = QWidget()
+        panel_content.setFixedWidth(270) # Maintain fixed width for the content inside scroll area
+        layout = QVBoxLayout(panel_content)
+        layout.setSpacing(14)
         layout.setAlignment(Qt.AlignTop)
 
         # --- Data group ---
         data_group = QGroupBox("Data")
         data_layout = QVBoxLayout(data_group)
         self.btn_open_file = QPushButton("Open File")
+        self.btn_open_file.setMinimumHeight(34)
         self.btn_open_file.clicked.connect(self.on_open_file)
         data_layout.addWidget(self.btn_open_file)
         layout.addWidget(data_group)
 
-       # --- Processing group ---
+        # --- Processing group ---
         processing_group = QGroupBox("Processing")
         processing_layout = QVBoxLayout(processing_group)
+        processing_layout.setContentsMargins(15, 20, 15, 20) # Keep margins for group box content
 
-        # Known G Value input -- a permanent field, since drift
-        # correction needs an absolute gravimeter reading entered
-        # manually by the surveyor for each session/circuit.
-        known_g_form = QFormLayout()
+        # Drift correction mode: with an absolute known G value (chains
+        # a full GValue column), or without one (per your mentor:
+        # produces the same Drift/CorrectedReading/DeltaG either way --
+        # only the GValue column is skipped -- useful for producing
+        # relative-only observations to feed the Phase 5 network
+        # adjustment, where absolute anchoring comes from a separate
+        # base-station reference sheet instead of from this file).
+        mode_label = QLabel("Drift Correction Mode:")
+        mode_label.setStyleSheet("font-weight: 600;")
+        processing_layout.addWidget(mode_label)
+
+        # Radio buttons for drift correction mode
+        radio_button_layout = QVBoxLayout()
+        radio_button_layout.setSpacing(5)
+        self.radio_with_known_g = QRadioButton("With Known G Value")
+        self.radio_without_known_g = QRadioButton("Without Known G Value")
+        self.radio_with_known_g.setChecked(True)
+        self.drift_mode_group = QButtonGroup(processing_group)
+        self.drift_mode_group.addButton(self.radio_with_known_g)
+        self.drift_mode_group.addButton(self.radio_without_known_g)
+        self.radio_with_known_g.toggled.connect(self._on_drift_mode_toggled)
+        radio_button_layout.addWidget(self.radio_with_known_g)
+        radio_button_layout.addWidget(self.radio_without_known_g)
+        processing_layout.addLayout(radio_button_layout)
+
+        processing_layout.addSpacing(15) # Spacing between radio buttons and G value input
+
+        # Known G Value input using QFormLayout for better alignment
+        known_g_form_layout = QFormLayout()
+        known_g_form_layout.setContentsMargins(0, 0, 0, 0)
+        known_g_form_layout.setVerticalSpacing(5)
+        known_g_label = QLabel("Known G Value:")
         self.input_known_g_value = QLineEdit()
         self.input_known_g_value.setPlaceholderText("e.g. 979.436285")
         self.input_known_g_value.setValidator(QDoubleValidator(-999999.0, 999999.0, 6))
-        known_g_form.addRow(QLabel("Known G Value:"), self.input_known_g_value)
-        processing_layout.addLayout(known_g_form)
+        self.input_known_g_value.setMinimumHeight(32)
+        known_g_form_layout.addRow(known_g_label, self.input_known_g_value)
+        processing_layout.addLayout(known_g_form_layout)
+
+        processing_layout.addSpacing(15) # Spacing between G value input and buttons
 
         self.btn_drift_correction = QPushButton("Drift Correction")
+        self.btn_drift_correction.setMinimumHeight(36)
         self.btn_drift_correction.clicked.connect(self.on_apply_drift_correction)
         self.btn_least_squares = QPushButton("Least Squares Adjustment")
+        self.btn_least_squares.setMinimumHeight(36)
         self.btn_least_squares.clicked.connect(self.on_run_least_squares)
         processing_layout.addWidget(self.btn_drift_correction)
         processing_layout.addWidget(self.btn_least_squares)
@@ -588,22 +661,25 @@ class MainWindow(QMainWindow):
         # Known G Value for Day 1 of a new line only. Ignored for every
         # subsequent day -- the anchor station's G value (carried over
         # from the previous day) is used instead, computed automatically.
-        known_g_day1_form = QFormLayout()
+        line_drift_layout.addWidget(QLabel("Known G (Day 1):"))
         self.input_line_drift_known_g = QLineEdit()
         self.input_line_drift_known_g.setPlaceholderText("e.g. 979.436285")
         self.input_line_drift_known_g.setValidator(QDoubleValidator(-999999.0, 999999.0, 6))
-        known_g_day1_form.addRow(QLabel("Known G (Day 1):"), self.input_line_drift_known_g)
-        line_drift_layout.addLayout(known_g_day1_form)
+        self.input_line_drift_known_g.setMinimumHeight(32)
+        line_drift_layout.addWidget(self.input_line_drift_known_g)
 
         self.line_drift_status_label = QLabel("No line in progress.")
         self.line_drift_status_label.setWordWrap(True)
         line_drift_layout.addWidget(self.line_drift_status_label)
 
         self.btn_line_drift_open_file = QPushButton("Open Day File")
+        self.btn_line_drift_open_file.setMinimumHeight(34)
         self.btn_line_drift_open_file.clicked.connect(self.on_open_line_drift_file)
         self.btn_line_drift_process = QPushButton("Process File")
+        self.btn_line_drift_process.setMinimumHeight(34)
         self.btn_line_drift_process.clicked.connect(self.on_process_line_drift)
         self.btn_line_drift_reset = QPushButton("Reset Line")
+        self.btn_line_drift_reset.setMinimumHeight(34)
         self.btn_line_drift_reset.clicked.connect(self.on_reset_line_drift)
         line_drift_layout.addWidget(self.btn_line_drift_open_file)
         line_drift_layout.addWidget(self.btn_line_drift_process)
@@ -615,18 +691,22 @@ class MainWindow(QMainWindow):
         graphs_group = QGroupBox("Graphs")
         graphs_layout = QVBoxLayout(graphs_group)
         self.btn_graph_raw_vs_adjusted = QPushButton("Raw vs Adjusted")
+        self.btn_graph_raw_vs_adjusted.setMinimumHeight(34)
         self.btn_graph_raw_vs_adjusted.clicked.connect(
             lambda: self.on_show_graph("raw_vs_adjusted")
         )
         self.btn_graph_drift_curve = QPushButton("Drift Curve")
+        self.btn_graph_drift_curve.setMinimumHeight(34)
         self.btn_graph_drift_curve.clicked.connect(
             lambda: self.on_show_graph("drift_curve")
         )
         self.btn_graph_residuals = QPushButton("Residual Plot")
+        self.btn_graph_residuals.setMinimumHeight(34)
         self.btn_graph_residuals.clicked.connect(
             lambda: self.on_show_graph("residual_plot")
         )
         self.btn_graph_histogram = QPushButton("Residual Histogram")
+        self.btn_graph_histogram.setMinimumHeight(34)
         self.btn_graph_histogram.clicked.connect(
             lambda: self.on_show_graph("residual_histogram")
         )
@@ -640,15 +720,26 @@ class MainWindow(QMainWindow):
         export_group = QGroupBox("Export")
         export_layout = QVBoxLayout(export_group)
         self.btn_export_excel = QPushButton("Export Excel")
+        self.btn_export_excel.setMinimumHeight(34)
         self.btn_export_excel.clicked.connect(self.on_export_excel)
         self.btn_export_pdf = QPushButton("Export PDF")
+        self.btn_export_pdf.setMinimumHeight(34)
         self.btn_export_pdf.clicked.connect(self.on_export_pdf)
+        self.btn_export_for_least_squares = QPushButton("Export for Least Squares")
+        self.btn_export_for_least_squares.setMinimumHeight(34)
+        self.btn_export_for_least_squares.setToolTip(
+            "Minimal export of just the drift-corrected results table "
+            "(no graphs, no summary) -- for use as a Phase 5 input file."
+        )
+        self.btn_export_for_least_squares.clicked.connect(self.on_export_for_least_squares)
         export_layout.addWidget(self.btn_export_excel)
         export_layout.addWidget(self.btn_export_pdf)
+        export_layout.addWidget(self.btn_export_for_least_squares)
         layout.addWidget(export_group)
-
         layout.addStretch(1)
-        return panel
+
+        scroll_area.setWidget(panel_content)
+        return scroll_area
 
     def _build_right_panel(self):
         """
@@ -676,7 +767,7 @@ class MainWindow(QMainWindow):
         self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.data_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.data_table.verticalHeader().setDefaultSectionSize(28)
-        self.data_table.setFont(QFont("Segoe UI", 10))
+        self.data_table.setFont(QFont(self.FONT_FAMILY, 10))
         data_box_layout.addWidget(self.data_table)
         splitter.addWidget(data_box)
 
@@ -689,7 +780,7 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.results_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.results_table.verticalHeader().setDefaultSectionSize(28)
-        self.results_table.setFont(QFont("Segoe UI", 10))
+        self.results_table.setFont(QFont(self.FONT_FAMILY, 10))
         results_box_layout.addWidget(self.results_table)
         splitter.addWidget(results_box)
 
@@ -718,7 +809,7 @@ class MainWindow(QMainWindow):
         self.line_drift_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.line_drift_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.line_drift_table.verticalHeader().setDefaultSectionSize(28)
-        self.line_drift_table.setFont(QFont("Segoe UI", 10))
+        self.line_drift_table.setFont(QFont(self.FONT_FAMILY, 10))
         results_box_layout.addWidget(self.line_drift_table)
         panel_layout.addWidget(results_box, stretch=3)
 
@@ -730,7 +821,7 @@ class MainWindow(QMainWindow):
         self.line_drift_log.setHorizontalHeaderLabels(["Day", "Anchor Station", "Closure Discrepancy"])
         self.line_drift_log.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.line_drift_log.verticalHeader().setDefaultSectionSize(26)
-        self.line_drift_log.setFont(QFont("Segoe UI", 10))
+        self.line_drift_log.setFont(QFont(self.FONT_FAMILY, 10))
         log_box_layout.addWidget(self.line_drift_log)
         panel_layout.addWidget(log_box, stretch=1)
 
@@ -871,11 +962,25 @@ class MainWindow(QMainWindow):
 
         self.data_table.resizeColumnsToContents()
 
+    def _on_drift_mode_toggled(self, checked: bool):
+        """
+        Slot for the drift-mode radio buttons. Enables/disables the
+        Known G Value field based on which mode is selected -- greyed
+        out (and its contents ignored) in 'Without Known G Value' mode.
+        """
+        self.input_known_g_value.setEnabled(checked)
+        if not checked:
+            self.input_known_g_value.clear()
+
     def on_apply_drift_correction(self):
         """
         Slot for the 'Drift Correction' button.
         Phase 4: validates inputs, then delegates the math to
-        core.drift.DriftCorrector. Displays the result in the results table.
+        core.drift.DriftCorrector. Displays the result in the results
+        table. Respects the With/Without Known G Value mode toggle --
+        in 'Without Known G Value' mode, Drift/CorrectedReading/DeltaG
+        are computed exactly the same way, but GValue is left blank
+        for every row (see core.drift.DriftCorrector.compute()).
         """
         if self.observation_data is None:
             QMessageBox.warning(
@@ -885,21 +990,22 @@ class MainWindow(QMainWindow):
             )
             return
 
-        g_text = self.input_known_g_value.text().strip()
-        if not g_text:
-            QMessageBox.warning(
-                self,
-                "Known G Value Required",
-                "Please enter the known (absolute) G value before applying "
-                "drift correction.",
-            )
-            return
-
-        try:
-            known_g_value = float(g_text)
-        except ValueError:
-            QMessageBox.warning(self, "Invalid G Value", f"'{g_text}' is not a valid number.")
-            return
+        known_g_value = None
+        if self.radio_with_known_g.isChecked():
+            g_text = self.input_known_g_value.text().strip()
+            if not g_text:
+                QMessageBox.warning(
+                    self,
+                    "Known G Value Required",
+                    "Please enter the known (absolute) G value, or switch to "
+                    "'Without Known G Value' mode.",
+                )
+                return
+            try:
+                known_g_value = float(g_text)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid G Value", f"'{g_text}' is not a valid number.")
+                return
 
         try:
             results = self.drift_corrector.compute(self.observation_data, known_g_value)
@@ -930,8 +1036,8 @@ class MainWindow(QMainWindow):
 
         The 'MeanTime' column is stored internally as total minutes
         (float) so drift/rate calculations work correctly, but it is
-        displayed here in the original 'H.MM' clock-style format
-        (e.g. 98.0 minutes -> "1.38") for readability.
+        displayed here in the 'H:MM' clock-style format (e.g. 98.0
+        minutes -> "1:38") for readability.
         """
         self.results_table.clear()
 
@@ -946,7 +1052,9 @@ class MainWindow(QMainWindow):
             for col_idx in range(num_cols):
                 value = dataframe.iat[row_idx, col_idx]
                 column_name = column_names[col_idx]
-                if column_name == "MeanTime" and isinstance(value, (int, float)):
+                if value is None:
+                    text = "\u2014"  # em dash, e.g. GValue column in 'Without Known G Value' mode
+                elif column_name == "MeanTime" and isinstance(value, (int, float)):
                     text = format_minutes_to_clock(value)
                 elif isinstance(value, float):
                     text = f"{value:.6f}"
@@ -1339,6 +1447,55 @@ class MainWindow(QMainWindow):
         self.set_status(f"Exported to '{file_name}'.")
         QMessageBox.information(
             self, "Export Successful", f"Data exported successfully to:\n{file_path}",
+        )
+
+    def on_export_for_least_squares(self):
+        """
+        Slot for the 'Export for Least Squares' button. Exports ONLY
+        the drift-corrected results table -- no graphs, no summary
+        block, no Observations sheet -- via
+        reports.excel_export.export_drift_only(). Intended as a clean,
+        minimal input file for the Phase 5 network adjustment, which
+        will re-import one file like this per survey day. Works in
+        both 'With Known G Value' and 'Without Known G Value' modes --
+        GValue is simply blank in the latter case.
+        """
+        if self.drift_corrected_data is None:
+            QMessageBox.warning(
+                self, "Nothing to Export",
+                "Please run drift correction before exporting for Least Squares.",
+            )
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export for Least Squares", "drift_corrected.xlsx",
+            "Excel Files (*.xlsx);;All Files (*)",
+        )
+        if not file_path:
+            self.set_status("Export for Least Squares cancelled.")
+            return
+        if not file_path.lower().endswith(".xlsx"):
+            file_path += ".xlsx"
+
+        try:
+            export_drift_only(file_path, self.drift_corrected_data)
+        except ExcelExportError as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+            self.set_status("Export for Least Squares failed.")
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Unexpected Error",
+                f"An unexpected error occurred while exporting:\n\n{exc}",
+            )
+            self.set_status("Export for Least Squares failed (unexpected error).")
+            return
+
+        file_name = os.path.basename(file_path)
+        self.set_status(f"Exported '{file_name}' for Least Squares input.")
+        QMessageBox.information(
+            self, "Export Successful",
+            f"Drift-corrected data exported successfully to:\n{file_path}",
         )
 
     def on_export_pdf(self):

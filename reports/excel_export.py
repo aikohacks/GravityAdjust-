@@ -112,6 +112,47 @@ def export_to_excel(
 # ------------------------------------------------------------------
 # INTERNAL SHEET BUILDERS
 # ------------------------------------------------------------------
+def export_drift_only(filepath: str, drift_corrected_data) -> None:
+    """
+    Write a MINIMAL .xlsx file containing just the drift-corrected
+    results table -- no title, no summary block, no Observations
+    sheet, no graphs. Intended specifically as a clean input file for
+    the Phase 5 network adjustment, which will re-import one file like
+    this per survey day and needs a stable, predictable schema to
+    parse (Station, MeanTime, MeanReading, Drift, CorrectedReading,
+    DeltaG, GValue) rather than a human-oriented report layout.
+
+    GValue may be blank for every row if this day was processed in
+    'Without Known G Value' mode -- that's expected and fine, since
+    Phase 5 only needs the DeltaG column from relative-only days;
+    absolute anchoring comes from a separate base-station reference
+    sheet, not from this file.
+
+    Args:
+        filepath: destination path, e.g. "/path/to/day1_drift.xlsx".
+        drift_corrected_data: DriftCorrector.compute() output DataFrame.
+
+    Raises:
+        ExcelExportError: if drift_corrected_data is None/empty, or if
+            writing the file fails for any reason.
+    """
+    if drift_corrected_data is None or drift_corrected_data.empty:
+        raise ExcelExportError(
+            "Nothing to export -- run drift correction before exporting "
+            "for Least Squares."
+        )
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Drift Corrected Results"
+
+    try:
+        _write_dataframe(sheet, drift_corrected_data, start_row=1, float_format="{:.6f}")
+        workbook.save(filepath)
+    except Exception as exc:
+        raise ExcelExportError(f"Failed to write Excel file: {exc}") from exc
+
+
 def _write_observations_sheet(workbook, observation_data):
     """Write the raw imported observations to an "Observations" sheet."""
     sheet = workbook.create_sheet("Observations")
@@ -221,14 +262,18 @@ def _write_dataframe(sheet, dataframe, start_row, float_format="{:.4f}", time_co
         for col_idx, column_name in enumerate(columns, start=1):
             value = row[column_name]
 
-            if column_name == time_column and isinstance(value, (int, float)):
+            if value is None:
+                text = ""  # blank cell (e.g. GValue in 'Without Known G Value' mode) --
+                           # left genuinely empty, not the string "None", so a later
+                           # pandas.read_excel() reads it back as NaN naturally.
+            elif column_name == time_column and isinstance(value, (int, float)):
                 text = format_minutes_to_clock(value)
             elif isinstance(value, float):
                 text = float_format.format(value)
             else:
                 text = str(value)
 
-            cell = sheet.cell(row=excel_row, column=col_idx, value=text)
+            cell = sheet.cell(row=excel_row, column=col_idx, value=(None if value is None else text))
             cell.font = BODY_FONT
             cell.alignment = CENTER
             cell.border = THIN_BORDER

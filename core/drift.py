@@ -111,7 +111,7 @@ class DriftCorrector:
     # ------------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------------
-    def compute(self, raw_df: pd.DataFrame, known_g_value: float) -> pd.DataFrame:
+    def compute(self, raw_df: pd.DataFrame, known_g_value: float = None) -> pd.DataFrame:
         """
         Run the full drift-correction pipeline on raw observation data.
 
@@ -124,12 +124,24 @@ class DriftCorrector:
                 number of visits.
             known_g_value: absolute gravity value (mGal or gal, per your
                 convention) for the very first visit of the circuit,
-                entered manually by the surveyor.
+                entered manually by the surveyor. OPTIONAL -- pass None
+                to run drift correction without an absolute reference.
+                This is the "without known G value" mode: Drift,
+                CorrectedReading, and DeltaG are all computed exactly
+                the same way either way (none of them depend on an
+                absolute reference), but the GValue column is left as
+                None for every row instead of being chained from a
+                starting value. This mode is intended for feeding the
+                resulting relative DeltaG observations into a later
+                network adjustment (Phase 5), where absolute anchoring
+                comes from a separate base-station reference sheet
+                instead of from this file.
 
         Returns:
             DataFrame with one row per station visit, columns:
             Station, MeanTime (minutes), MeanReading, Drift,
-            CorrectedReading, DeltaG, GValue.
+            CorrectedReading, DeltaG, GValue. GValue is None for every
+            row if known_g_value was None.
 
         Raises:
             DriftCorrectionError: if required columns are missing, or
@@ -151,6 +163,7 @@ class DriftCorrector:
         results.attrs["total_time_minutes"] = total_time
         results.attrs["total_drift"] = total_drift
         results.attrs["drift_rate_per_minute"] = drift_rate
+        results.attrs["known_g_value_provided"] = known_g_value is not None
 
         return results
 
@@ -390,12 +403,18 @@ class DriftCorrector:
         return total_time, total_drift, drift_rate
 
     def _apply_drift_and_gvalue(self, visits, drift_rate, known_g_value):
-        """Apply per-visit drift, corrected reading, delta-g, and G value."""
+        """
+        Apply per-visit drift, corrected reading, and delta-g -- these
+        never depend on known_g_value. GValue is chained from
+        known_g_value if it was provided; if known_g_value is None
+        ("without known G value" mode), GValue is left as None for
+        every row, since there's nothing to chain from.
+        """
         first_visit = visits[0]
         rows = []
 
         previous_corrected = None
-        g_value = known_g_value
+        g_value = known_g_value  # None in "without known G" mode
 
         for visit in visits:
             elapsed = visit["mean_time_minutes"] - first_visit["mean_time_minutes"]
@@ -406,7 +425,8 @@ class DriftCorrector:
                 delta_g = 0.0
             else:
                 delta_g = (corrected_reading - previous_corrected) / 1000.0
-                g_value = g_value + delta_g
+                if g_value is not None:
+                    g_value = g_value + delta_g
 
             rows.append({
                 "Station": visit["station"],
