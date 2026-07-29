@@ -56,6 +56,7 @@ from matplotlib.figure import Figure
 from core.data_loader import GravityDataLoader, DataLoadError
 from core.drift import DriftCorrector, DriftCorrectionError, format_minutes_to_clock
 from core.line_drift import LineDriftCorrector, LineDriftError
+from core.adjustment import NetworkAdjustment, AdjustmentError
 from reports.excel_export import export_to_excel, export_drift_only, ExcelExportError
 from reports.pdf_report import export_to_pdf, PdfReportError
 from visualization import graphs
@@ -122,6 +123,7 @@ class MainWindow(QMainWindow):
         self.drift_corrected_data = None  # will hold drift-corrected visits (Phase 4)
         self.adjusted_results = None   # will hold least-squares results (Phase 5/6)
         # Data loader (computation logic lives in core/, not here)
+        self.least_squares_results = None  # Station/AdjustedGValue table (Phase 5)
         self.data_loader = GravityDataLoader()
         self.drift_corrector = DriftCorrector(readings_per_visit=5)
 
@@ -132,6 +134,7 @@ class MainWindow(QMainWindow):
         # into the same self.line_drift_results list, in chronological
         # order, so the results table always shows the whole line so far.
         self.line_drift_corrector = LineDriftCorrector()
+        self.network_adjustment = NetworkAdjustment()
         self.line_drift_pending_data = None  # most recently opened, not-yet-processed file
         self.line_drift_results = []  # list of per-day result DataFrames, chronological
         self.setWindowTitle(self.WINDOW_TITLE)
@@ -443,6 +446,43 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover:!selected {
                 background-color: #3d5166;
             }
+            /* ---------------------------------------------------- */
+            /* File dialogs (Open/Save) -- explicit styling so they  */
+            /* don't inherit dark-text-on-dark-background from the   */
+            /* OS dark theme when using the non-native Qt dialog.    */
+            /* ---------------------------------------------------- */
+            QFileDialog {
+                background-color: #ffffff;
+                color: #1a2330;
+            }
+            QFileDialog QWidget {
+                background-color: #ffffff;
+                color: #1a2330;
+            }
+            QFileDialog QListView, QFileDialog QTreeView {
+                background-color: #ffffff;
+                color: #1a2330;
+                selection-background-color: #2c6fbb;
+                selection-color: #ffffff;
+            }
+            QFileDialog QComboBox {
+                background-color: #ffffff;
+                color: #1a2330;
+                border: 1px solid #a9b2bd;
+                padding: 4px;
+            }
+            QFileDialog QToolButton {
+                background-color: transparent;
+                color: #1a2330;
+                padding: 4px;
+            }
+            QFileDialog QToolButton:hover {
+                background-color: #e3ebf5;
+            }
+            QFileDialog QPushButton {
+                background-color: #2c6fbb;
+                color: #ffffff;
+            }
             """
         )
 
@@ -742,20 +782,79 @@ class MainWindow(QMainWindow):
         return scroll_area
 
     def _build_right_panel(self):
-        """
-        Builds the right-hand QTabWidget containing the "Data & Results"
-        tab (existing tables splitter), the "Line Drift" tab (multi-day
-        results, stacked with a Day column), and the "Graphs" tab (Phase 7).
-        """
         self.main_tab_widget = QTabWidget()
         self.main_tab_widget.addTab(self._build_tables_panel(), "Data && Results")
         line_drift_tab_index = self.main_tab_widget.addTab(self._build_line_drift_panel(), "Line Drift")
         self.main_tab_widget.setTabVisible(line_drift_tab_index, self.LINE_DRIFT_UI_ENABLED)
+        self.main_tab_widget.addTab(self._build_least_squares_panel(), "Least Squares")
         self.main_tab_widget.addTab(self._build_graphs_panel(), "Graphs")
         return self.main_tab_widget
 
+    def _build_least_squares_panel(self):
+        """
+        Builds the "Least Squares" tab: two sub-tabs, "Adjusted Values"
+        (one row per unique station, its solved gravity value) and
+        "Residuals" (one row per observation, its misfit) -- kept as
+        separate tables since they have entirely different shapes.
+        """
+        self.least_squares_tab_widget = QTabWidget()
+
+        adjusted_tab = QWidget()
+        adjusted_layout = QVBoxLayout(adjusted_tab)
+        adjusted_layout.setContentsMargins(4, 4, 4, 4)
+        self.ls_adjusted_table = QTableWidget(0, 0)
+        self.ls_adjusted_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ls_adjusted_table.setAlternatingRowColors(True)
+        self.ls_adjusted_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.ls_adjusted_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.ls_adjusted_table.verticalHeader().setDefaultSectionSize(28)
+        self.ls_adjusted_table.setFont(QFont("Segoe UI", 10))
+        adjusted_layout.addWidget(self.ls_adjusted_table)
+        self.least_squares_tab_widget.addTab(adjusted_tab, "Adjusted Values")
+
+        residuals_tab = QWidget()
+        residuals_layout = QVBoxLayout(residuals_tab)
+        residuals_layout.setContentsMargins(4, 4, 4, 4)
+        self.ls_residuals_table = QTableWidget(0, 0)
+        self.ls_residuals_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ls_residuals_table.setAlternatingRowColors(True)
+        self.ls_residuals_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.ls_residuals_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.ls_residuals_table.verticalHeader().setDefaultSectionSize(28)
+        self.ls_residuals_table.setFont(QFont("Segoe UI", 10))
+        residuals_layout.addWidget(self.ls_residuals_table)
+        self.least_squares_tab_widget.addTab(residuals_tab, "Residuals")
+
+        return self.least_squares_tab_widget
+
+    def _populate_generic_table(self, table_widget, dataframe, float_format="{:.6f}"):
+        """Shared fill logic for simple result tables (Least Squares tables)."""
+        table_widget.clear()
+
+        num_rows, num_cols = dataframe.shape
+        table_widget.setRowCount(num_rows)
+        table_widget.setColumnCount(num_cols)
+        table_widget.setHorizontalHeaderLabels([str(c) for c in dataframe.columns])
+
+        for row_idx in range(num_rows):
+            for col_idx in range(num_cols):
+                value = dataframe.iat[row_idx, col_idx]
+                if isinstance(value, float):
+                    text = float_format.format(value)
+                else:
+                    text = str(value)
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                table_widget.setItem(row_idx, col_idx, item)
+
+        table_widget.resizeColumnsToContents()
+
+    def populate_least_squares_tables(self, results_df, residuals_df):
+        """Fill both the Adjusted Values and Residuals tables."""
+        self._populate_generic_table(self.ls_adjusted_table, results_df)
+        self._populate_generic_table(self.ls_residuals_table, residuals_df)
+
     def _build_tables_panel(self):
-        """Builds the splitter containing the data and results tables."""
         splitter = QSplitter(Qt.Vertical)
 
         # --- Observation data table ---
@@ -1338,8 +1437,91 @@ class MainWindow(QMainWindow):
                 self.line_drift_log.setItem(row_idx, col_idx, item)
 
     def on_run_least_squares(self):
-        """Placeholder slot for least squares adjustment (implemented in Phase 5)."""
-        self._show_not_implemented("Least Squares Adjustment", phase=5)
+        """
+        Slot for the 'Least Squares Adjustment' button.
+
+        Prompts for a batch of daily drift-corrected files (multi-
+        select, one dialog) plus a single Base Station Reference file,
+        then delegates matrix assembly and solving entirely to
+        core.adjustment.NetworkAdjustment. Per the file-based
+        architecture, nothing is read from in-memory state here (not
+        even self.drift_corrected_data) -- every file is read fresh
+        from disk.
+        """
+        day_file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Daily Drift-Corrected Files (select all that apply)",
+            "",
+            "Excel Files (*.xlsx *.xls);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not day_file_paths:
+            self.set_status("Least Squares Adjustment cancelled (no daily files selected).")
+            return
+
+        base_file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Base Station Reference File",
+            "",
+            "Excel/CSV Files (*.xlsx *.xls *.csv);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not base_file_path:
+            self.set_status("Least Squares Adjustment cancelled (no Base Station Reference file selected).")
+            return
+
+        try:
+            daily_dataframes = [
+                self.network_adjustment.load_drift_corrected_file(p) for p in day_file_paths
+            ]
+            base_station_df = self.network_adjustment.load_base_station_reference(base_file_path)
+        except AdjustmentError as exc:
+            QMessageBox.critical(self, "Least Squares Adjustment Failed", str(exc))
+            self.set_status("Least Squares Adjustment failed (file loading).")
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Unexpected Error",
+                f"An unexpected error occurred while loading input files:\n\n{exc}",
+            )
+            self.set_status("Least Squares Adjustment failed (unexpected error).")
+            return
+
+        try:
+            A, L, station_ids, sigma, obs_labels = self.network_adjustment.build_network(
+                daily_dataframes, base_station_df
+            )
+            results_df, residuals_df = self.network_adjustment.solve_unweighted(
+                A, L, station_ids, obs_labels
+            )
+        except AdjustmentError as exc:
+            QMessageBox.critical(self, "Least Squares Adjustment Failed", str(exc))
+            self.set_status("Least Squares Adjustment failed.")
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Unexpected Error",
+                f"An unexpected error occurred during the adjustment:\n\n{exc}",
+            )
+            self.set_status("Least Squares Adjustment failed (unexpected error).")
+            return
+
+        self.least_squares_results = results_df
+        # Reuse the existing self.adjusted_results slot (already wired
+        # to the Residual Plot / Residual Histogram graphs) so those
+        # graphs work immediately with real data, no extra plumbing.
+        self.adjusted_results = residuals_df
+        self.populate_least_squares_tables(results_df, residuals_df)
+
+        self.main_tab_widget.setCurrentWidget(self.least_squares_tab_widget)
+
+        self.set_status(
+            f"Least Squares Adjustment complete: {len(station_ids)} station(s), "
+            f"{len(obs_labels)} observation(s) from {len(day_file_paths)} day file(s)."
+        )
+
+        self._refresh_graph("residual_plot")
+        self._refresh_graph("residual_histogram")
 
     def on_show_graph(self, graph_type: str):
         """
