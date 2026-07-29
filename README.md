@@ -6,16 +6,16 @@ A desktop application (PySide6) for processing relative gravity survey field obs
 
 | Phase | Feature | Status |
 |---|---|---|
-| 1 | GUI shell (window, menus, toolbar, tables) | ✅ Done |
-| 2 | File import (CSV/XLSX) | ✅ Done |
-| 3 | Display imported data | ✅ Done |
-| 4 | Drift correction (Circuit Drift) | ✅ Done |
-| 5 | Least Squares Adjustment | 🔒 Not started — pending domain input |
-| 6 | Statistics | 🔒 Not started — pending domain input |
-| 7 | Graphs | ✅ Done |
-| 8 | Excel export | ✅ Done |
-| 9 | PDF export | ✅ Done |
-| — | Line Drift (multi-day) | ⏸️ Built and tested, hidden — superseded by the Phase 5 network-adjustment approach |
+| 1 | GUI shell (window, menus, toolbar, tables) |  Done |
+| 2 | File import (CSV/XLSX) |  Done |
+| 3 | Display imported data |  Done |
+| 4 | Drift correction (Circuit Drift) |  Done |
+| 5 | Least Squares Adjustment |  started  |
+| 6 | Statistics |  Not started — pending domain input |
+| 7 | Graphs |  Done |
+| 8 | Excel export |  Done |
+| 9 | PDF export |  Done |
+| — | Line Drift (multi-day) |  Built and tested, hidden — superseded by the Phase 5 network-adjustment approach |
 
 ## Features
 
