@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Generated/exported files (test data, reports)
+outputs/*.xlsx
+outputs/*.pdf
+outputs/*.csv
+data/*.xlsx
+data/*.csv
+!data/sample_*.csv
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
