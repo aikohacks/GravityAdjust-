@@ -8,6 +8,8 @@ This module contains NO GUI code -- it is pure computation.
 """
 
 import re
+import warnings
+
 import pandas as pd
 
 
@@ -54,19 +56,21 @@ class DriftCorrector:
     # reference file are also mGal). A visit whose sub-readings are all
     # identical has a sample std of 0, and a single-reading visit has no
     # std at all -- either would become an infinite weight (1/sigma^2)
-    # in the weighted adjustment. Flooring at 0.1 microGal (1e-4 mGal)
-    # keeps such degenerate visits finite AND keeps the weight ratio
-    # between the tightest relative tie and the base-station pseudo-
-    # observations within safe double-precision bounds (a much smaller
-    # floor, e.g. 1e-9 counter units ~ 1e-12 mGal, produces weight
-    # ratios ~1e21 that silently corrupt the normal-equations solve).
-    # 1e-4 mGal is also below the repeatability of any real gravimeter,
-    # so it never distorts genuine data.
-    MIN_SIGMA_MGAL = 1e-4
+    # in the weighted adjustment. Flooring at 0.01 microGal (1e-5 mGal)
+    # keeps such degenerate visits finite. The floor sits well below the
+    # repeatability of any real gravimeter (CG-5/CG-6: ~1-5 microGal =
+    # 1e-3..5e-3 mGal), so it never distorts genuine data -- it only
+    # caps the weight of degenerate zero-variance visits. The SVD-based
+    # solve in core.adjustment keeps even extreme weight ratios
+    # numerically safe. Overridable per instance via `min_sigma_mgal`.
+    MIN_SIGMA_MGAL = 1e-5
 
-    def __init__(self, reading_precision: int = 3, drift_precision: int = 3, readings_per_visit: int = None):
+    def __init__(self, reading_precision: int = 3, drift_precision: int = 3,
+                 readings_per_visit: int = None, min_sigma_mgal: float = None):
         self.reading_precision = reading_precision
         self.drift_precision = drift_precision
+        if min_sigma_mgal is not None:
+            self.MIN_SIGMA_MGAL = min_sigma_mgal
         # readings_per_visit is accepted but unused -- kept only for
         # backward compatibility with older call sites; visit grouping
         # is dynamic (see _group_into_visits), not a fixed block size.
@@ -99,11 +103,19 @@ class DriftCorrector:
         """
         df = self._normalize_columns(raw_df)
         self._validate_columns(df)
+        self._validate_data_quality(df)
 
         visits = self._group_into_visits(df)
         self._validate_circuit_closure(visits)
 
         visits = self._compute_mean_time_and_reading(visits)
+        for visit in visits:
+            if visit.get("outlier_count", 0):
+                warnings.warn(
+                    f"Station '{visit['station']}': {visit['outlier_count']} of "
+                    f"{len(visit['readings'])} sub-reading(s) flagged as outliers "
+                    f"(MAD > 3 sigma) and excluded from the visit mean."
+                )
         visits = self._unwrap_12hr_rollover(visits)
         total_time, total_drift, drift_rate = self._compute_circuit_drift_rate(visits)
 
@@ -116,6 +128,7 @@ class DriftCorrector:
         results.attrs["total_drift"] = total_drift
         results.attrs["drift_rate_per_minute"] = drift_rate
         results.attrs["is_absolute"] = is_absolute
+        results.attrs["drift_quality"] = self._compute_drift_quality(visits, drift_rate)
 
         return results
 
@@ -247,33 +260,128 @@ class DriftCorrector:
                 f"survey to start and end at the same base station."
             )
 
+    def _detect_outliers(self, readings, threshold: float = 3.0):
+        """
+        Flag outlier sub-readings using the Median Absolute Deviation
+        (MAD) method -- robust to the outliers themselves, unlike
+        mean/std. A reading whose |z| = |x - median| / (1.4826 * MAD)
+        exceeds `threshold` is flagged as an outlier.
+
+        Returns a boolean mask aligned with `readings`. Degenerate
+        inputs (fewer than 3 readings, or MAD == 0 -- i.e. all readings
+        identical) never flag anything.
+        """
+        readings = pd.Series(readings, dtype=float)
+        n = len(readings)
+        if n < 3:
+            return pd.Series([False] * n, index=readings.index)
+        median = readings.median()
+        mad = (readings - median).abs().median()
+        if mad == 0:
+            return pd.Series([False] * n, index=readings.index)
+        z_scores = (readings - median) / (mad * 1.4826)
+        return z_scores.abs() > threshold
+
     def _compute_mean_time_and_reading(self, visits):
-        """Add mean time (in minutes), mean reading, and reading_sigma to each visit dict."""
+        """
+        Add mean time (in minutes), mean reading, and reading_sigma to
+        each visit dict.
+
+        - Outlier sub-readings (MAD, 3-sigma) are excluded from the
+          visit mean and sigma so one bad reading cannot corrupt the
+          visit estimate. The number excluded is kept on the visit as
+          `outlier_count` for reporting.
+        - reading_sigma is the standard error of the mean of the CLEAN
+          sub-readings, in raw counter units (converted to mGal later
+          in _apply_drift_and_gvalue).
+        - Single-reading visits have no internal sigma estimate; they
+          inherit the circuit-wide AVERAGE reading_sigma from the
+          multi-reading visits (falling back to None -- and thus the
+          MIN_SIGMA_MGAL floor -- only if no visit in the circuit has
+          an estimate).
+        """
+        # First pass: per-visit mean, outlier rejection, and sigma.
         for visit in visits:
             minutes_list = [self.parse_time_to_minutes(t) for t in visit["times"]]
             visit["mean_time_minutes"] = sum(minutes_list) / len(minutes_list)
-            raw_mean = sum(visit["readings"]) / len(visit["readings"])
+
+            readings = pd.Series(visit["readings"], dtype=float)
+            is_outlier = self._detect_outliers(readings)
+            visit["outlier_count"] = int(is_outlier.sum())
+
+            clean = readings[~is_outlier]
+            if len(clean) == 0:
+                # Every reading flagged (pathological data) -- fall back
+                # to the full set so we still produce an estimate, but
+                # record that nothing was excluded.
+                clean = readings
+                visit["outlier_count"] = 0
+
+            raw_mean = clean.mean()
             visit["mean_reading"] = round(raw_mean, self.reading_precision)
 
-            # Standard error of the mean, from the repeatability of this
-            # visit's raw sub-readings -- an internal precision estimate
-            # used downstream (Phase 5) to weight DeltaG observations.
-            # Note: this captures short-term instrument/reading noise
-            # only, not other error sources (drift-model uncertainty,
-            # transport disturbance, temperature) -- documented as a
-            # deliberate first-version limitation.
-            # Standard error of the mean, in RAW reading (counter)
-            # units. Kept in counter units here (may be 0 for identical
-            # sub-readings, or None for single-reading visits); the
-            # conversion to milligals and the positive floor both happen
-            # in _apply_drift_and_gvalue where DeltaG is converted too.
-            n = len(visit["readings"])
+            n = len(clean)
             if n > 1:
-                std_dev = pd.Series(visit["readings"]).std(ddof=1)
+                std_dev = clean.std(ddof=1)
                 visit["reading_sigma"] = std_dev / (n ** 0.5)
             else:
                 visit["reading_sigma"] = None
+
+        # Second pass: single-reading visits inherit the circuit-wide
+        # average sigma instead of masquerading as perfectly known.
+        computed = [v["reading_sigma"] for v in visits if v["reading_sigma"] is not None]
+        if computed:
+            circuit_avg_sigma = sum(computed) / len(computed)
+            for visit in visits:
+                if visit["reading_sigma"] is None:
+                    visit["reading_sigma"] = circuit_avg_sigma
         return visits
+
+    def _compute_drift_quality(self, visits, drift_rate):
+        """
+        Assess how well the linear drift model fits the observed
+        readings: R^2, RMS of residuals, max absolute residual, and the
+        number of visits used. The linear model is the first visit's
+        reading plus drift_rate * elapsed time.
+        """
+        first = visits[0]
+        predicted, actual = [], []
+        for visit in visits:
+            elapsed = visit["mean_time_minutes"] - first["mean_time_minutes"]
+            predicted.append(first["mean_reading"] + drift_rate * elapsed)
+            actual.append(visit["mean_reading"])
+
+        predicted = pd.Series(predicted, dtype=float)
+        actual = pd.Series(actual, dtype=float)
+        residuals = predicted - actual
+
+        rms_residual = float((residuals ** 2).mean() ** 0.5)
+        max_residual = float(residuals.abs().max())
+        ss_tot = float(((actual - actual.mean()) ** 2).sum())
+        ss_res = float((residuals ** 2).sum())
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        return {
+            "rms_residual": rms_residual,
+            "max_residual": max_residual,
+            "r_squared": r_squared,
+            "num_visits": len(visits),
+        }
+
+    def _validate_data_quality(self, df: pd.DataFrame):
+        """
+        Lightweight data-quality checks on the raw input. Currently
+        warns on negative raw readings, which are invalid for gravity
+        instruments and usually indicate a transcription error or a
+        swapped column.
+        """
+        reading_series = df["Reading"]
+        if (reading_series < 0).any():
+            count = int((reading_series < 0).sum())
+            warnings.warn(
+                f"Data quality: {count} negative Reading value(s) found. "
+                f"Gravity readings must be positive -- please check the data."
+            )
 
     def _unwrap_12hr_rollover(self, visits):
         """
@@ -291,7 +399,13 @@ class DriftCorrector:
         for i in range(1, len(visits)):
             candidate = visits[i]["mean_time_minutes"] + offset
             if candidate < adjusted[-1]:
-                offset += 720
+                # Candidate is still earlier than the previous visit
+                # even after the accumulated rollover offset -- it
+                # crossed the 12:00 mark again. Add enough 720-minute
+                # blocks to land after the previous visit, handling
+                # circuits that span multiple 12-hour crossings.
+                blocks = int((adjusted[-1] - candidate) // 720) + 1
+                offset += 720 * blocks
                 candidate = visits[i]["mean_time_minutes"] + offset
             adjusted.append(candidate)
 

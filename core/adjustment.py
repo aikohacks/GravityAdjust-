@@ -211,7 +211,27 @@ class NetworkAdjustment:
                 )
             rename_map[col] = canonical
 
-        return df.rename(columns=rename_map)[["Station", "KnownG", "Sigma"]]
+        df = df.rename(columns=rename_map)[["Station", "KnownG", "Sigma"]]
+
+        # Validate the Sigma column: it must hold strictly positive
+        # numeric values. A zero or negative Sigma would produce an
+        # infinite/negative weight in the weighted solve.
+        sigma_values = pd.to_numeric(df["Sigma"], errors="coerce")
+        if sigma_values.isna().all():
+            raise AdjustmentError(
+                "Base Station Reference file: all Sigma values are missing "
+                "or non-numeric. Sigma must be a positive number (mGal) for "
+                "each station."
+            )
+        if (sigma_values <= 0).any():
+            bad_stations = df.loc[sigma_values <= 0, "Station"].tolist()
+            raise AdjustmentError(
+                "Base Station Reference file: Sigma must be positive for every "
+                "station (got <= 0 for: " + ", ".join(str(s) for s in bad_stations) + "). "
+                "A zero or negative Sigma would produce an invalid (infinite) weight."
+            )
+
+        return df
 
     @staticmethod
     def _find_column(df: pd.DataFrame, keywords, require_all: bool = False):
@@ -292,6 +312,19 @@ class NetworkAdjustment:
                 f"Invalid relative_sigma_source '{relative_sigma_source}'. "
                 f"Must be one of: {', '.join(self.VALID_RELATIVE_SIGMA_SOURCES)}."
             )
+
+        # Validate base-station Sigma values up front, whether the
+        # DataFrame came from load_base_station_reference() (which
+        # validates too) or was constructed/edited in memory.
+        if "Sigma" in base_station_df.columns:
+            sigma_values = pd.to_numeric(base_station_df["Sigma"], errors="coerce")
+            if (sigma_values <= 0).any():
+                bad_stations = base_station_df.loc[sigma_values <= 0, "Station"].tolist()
+                raise AdjustmentError(
+                    "Base Station Reference: Sigma must be positive for every "
+                    "station (got <= 0 for: " + ", ".join(str(s) for s in bad_stations) + "). "
+                    "A zero or negative Sigma would produce an invalid (infinite) weight."
+                )
 
         if relative_sigma_source == "mean_sigma_column":
             missing_files = [
@@ -572,9 +605,49 @@ class NetworkAdjustment:
         X, _, _, _ = np.linalg.lstsq(weighted_A, weighted_L, rcond=None)
 
         results_df = pd.DataFrame({"Station": station_ids, "AdjustedGValue": X})
-
         residuals = A @ X - L
         residuals_df = pd.DataFrame({"Observation": obs_labels, "Residual": residuals})
+
+        # --- A posteriori statistics (weighted) ---
+        # n observations, m unknowns -> redundancy dof = n - m. When
+        # dof <= 0 the system has no redundancy left for a variance
+        # estimate, so the variance factor is undefined (NaN).
+        n_obs = len(L)
+        m_unknowns = A.shape[1]
+        dof = n_obs - m_unknowns
+
+        if dof > 0:
+            variance_factor = float(np.sum(residuals ** 2 * weights) / dof)
+        else:
+            variance_factor = float("nan")
+
+        # Parameter covariance matrix from the SVD of the weighted
+        # design matrix: Cov = V diag(1/S^2) V^T * variance_factor.
+        # (Recompute the SVD explicitly -- cheap for adjustment-sized
+        # systems -- to obtain V and S directly.)
+        try:
+            _, S, Vt = np.linalg.svd(weighted_A, full_matrices=False)
+            s_inv_sq = np.where(S > 1e-12, 1.0 / (S ** 2), 0.0)
+            covariance = (Vt.T * s_inv_sq) @ Vt * variance_factor
+            std_errors = np.sqrt(np.clip(np.diag(covariance), 0, None))
+        except np.linalg.LinAlgError:
+            covariance = None
+            std_errors = np.full(m_unknowns, np.nan)
+
+        results_df["StdError"] = std_errors
+        results_df.attrs["statistics"] = {
+            "n_observations": n_obs,
+            "m_unknowns": m_unknowns,
+            "degrees_of_freedom": dof,
+            "variance_factor": variance_factor,
+            "a_posteriori_sigma": (
+                float(variance_factor ** 0.5)
+                if np.isfinite(variance_factor) and variance_factor >= 0
+                else float("nan")
+            ),
+            "covariance": covariance,
+            "std_errors": std_errors,
+        }
 
         return results_df, residuals_df
 

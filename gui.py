@@ -1030,7 +1030,7 @@ class MainWindow(QMainWindow):
         self.ls_adjusted_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.ls_adjusted_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ls_adjusted_table.verticalHeader().setDefaultSectionSize(28)
-        self.ls_adjusted_table.setFont(QFont("Segoe UI", 10))
+        self.ls_adjusted_table.setFont(QFont(self.FONT_FAMILY, 10))
         adjusted_layout.addWidget(self.ls_adjusted_table)
         self.least_squares_tab_widget.addTab(adjusted_tab, "Adjusted Values")
 
@@ -1043,7 +1043,7 @@ class MainWindow(QMainWindow):
         self.ls_residuals_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.ls_residuals_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ls_residuals_table.verticalHeader().setDefaultSectionSize(28)
-        self.ls_residuals_table.setFont(QFont("Segoe UI", 10))
+        self.ls_residuals_table.setFont(QFont(self.FONT_FAMILY, 10))
         residuals_layout.addWidget(self.ls_residuals_table)
         self.least_squares_tab_widget.addTab(residuals_tab, "Residuals")
 
@@ -1763,6 +1763,14 @@ class MainWindow(QMainWindow):
             f"Least Squares Adjustment complete ({mode_label}): {len(station_ids)} station(s), "
             f"{len(obs_labels)} observation(s) from {len(day_file_paths)} day file(s)."
         )
+        # Surface the a posteriori statistics (variance factor / sigma0)
+        # computed by core.adjustment.solve when there is redundancy.
+        stats = results_df.attrs.get("statistics", {})
+        if stats.get("degrees_of_freedom", 0) > 0:
+            status_text += (
+                f"  Redundancy (dof)={stats['degrees_of_freedom']}, "
+                f"sigma0={stats['a_posteriori_sigma']:.4g} mGal."
+            )
         if closure_checks:
             status_text += (
                 f" {len(closure_checks)} closure check(s) recorded "
