@@ -20,17 +20,24 @@ class DriftCorrectionError(Exception):
 
 def format_minutes_to_clock(total_minutes: float) -> str:
     """
-    Convert total minutes (e.g. 98.0) back into an H:MM display string
-    (e.g. "1:38"), for readability in the GUI. Handles values that have
-    been "unwrapped" past 12 hours (720 min) by taking mod 720 first.
+    Convert total minutes past midnight (e.g. 511.0) back into an
+    HH:MM clock-time display string (e.g. "08:31"), matching how the
+    time is recorded in the original field data sheets. Used for
+    display in the GUI and when exporting to Excel/PDF.
+
+    Values are minutes from midnight, wrapped modulo 24 hours (1440
+    min). The drift-unwrap step can push a visit past the 12:00 mark
+    (e.g. 13:00 -> 780 min); the 24-hour wrap keeps such times
+    displaying as "13:00" rather than "01:00".
     """
-    wrapped = total_minutes % 720
+    wrapped = total_minutes % 1440
     hours = int(wrapped // 60)
     minutes = int(round(wrapped % 60))
     if minutes == 60:
         minutes = 0
         hours += 1
-    return f"{hours}:{minutes:02d}"
+    hours %= 24  # rounding edge (e.g. 23:59:30 -> 24:00 -> 00:00)
+    return f"{hours:02d}:{minutes:02d}"
 
 
 class DriftCorrector:

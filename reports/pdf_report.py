@@ -234,7 +234,7 @@ def _dataframe_to_table(dataframe, float_format="{:.4f}", time_column=None):
 
     Args:
         time_column: if given, that column's values are formatted via
-            core.drift.format_minutes_to_clock() (H:MM) instead of the
+            core.drift.format_minutes_to_clock() (HH:MM clock time) instead of the
             raw float, matching the app's own table display convention.
     """
     columns = [str(c) for c in dataframe.columns]
