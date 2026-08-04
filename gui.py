@@ -46,6 +46,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QScrollArea,
+    QDialog,
+    QDialogButtonBox,
 )
 from PySide6.QtGui import QAction, QFont, QKeySequence, QIcon, QDoubleValidator
 from PySide6.QtCore import Qt, QSize
@@ -62,6 +64,225 @@ from reports.pdf_report import export_to_pdf, PdfReportError
 from visualization import graphs
 
 import os
+
+
+class LeastSquaresConfigDialog(QDialog):
+    """
+    Modal configuration dialog shown when the user clicks "Least
+    Squares Adjustment" / "Run Least Squares Adjustment" (Phase 5),
+    BEFORE the network math runs. The adjustment no longer executes
+    with hard-coded defaults -- the user picks the weighting scheme
+    here and the settings are passed through to
+    core.adjustment.NetworkAdjustment.build_network().
+
+    Options collected:
+
+      Adjustment Mode
+        * Approach A -- Partial Constraints (Weighted): base stations
+          stay in the solve as weighted observations (mode "partial").
+          Their sigma comes from the Base Station Reference file's
+          Sigma column when present, otherwise from the "Absolute
+          Base Station Sigma" fallback below.
+        * Approach B -- Hard-Fixed (Zero Variance): base station
+          values are exact constants (mode "hard_fixed") -- they are
+          substituted out of the normal equations and never change.
+          Relative ties still get weighted.
+
+      Relative Tie (DeltaG) Sigma
+        * "Use a global manual sigma for all relative ties": one
+          sigma value (default 5.0) applied to every DeltaG
+          observation (relative_sigma_source="manual").
+        * "Read propagated 'MeanSigma' from drift output": each tie's
+          sigma is read from the MeanSigma column produced by
+          core.drift.DriftCorrector.compute() and round-tripped
+          through the "Export for Least Squares" file
+          (relative_sigma_source="mean_sigma_column").
+
+    get_config() returns a plain dict whose keys map 1:1 onto
+    NetworkAdjustment.build_network()'s keyword arguments: mode,
+    relative_sigma_source, manual_relative_sigma, manual_base_sigma.
+    """
+
+    MODE_PARTIAL = "partial"
+    MODE_HARD_FIXED = "hard_fixed"
+    SIGMA_SOURCE_MANUAL = "manual"
+    SIGMA_SOURCE_MEANSIGMA = "mean_sigma_column"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Least Squares Adjustment Configuration")
+        self.setMinimumWidth(500)
+        self._config = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # --- Adjustment mode ---
+        mode_group = QGroupBox("Adjustment Mode")
+        mode_layout = QVBoxLayout(mode_group)
+        mode_layout.setSpacing(5)
+        self.radio_mode_partial = QRadioButton(
+            "Approach A: Partial Constraints (Weighted)"
+        )
+        self.radio_mode_partial.setToolTip(
+            "Base stations stay in the solve as weighted observations: "
+            "their sigma comes from the Base Station Reference file's "
+            "Sigma column, or the fallback below, so they can shift "
+            "slightly if the network pulls them."
+        )
+        self.radio_mode_hard_fixed = QRadioButton(
+            "Approach B: Hard-Fixed (Zero Variance)"
+        )
+        self.radio_mode_hard_fixed.setToolTip(
+            "Base stations are exact constants: their known values are "
+            "substituted into the observation equations and never "
+            "change; only the non-fixed stations are solved."
+        )
+        self.radio_mode_partial.setChecked(True)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.radio_mode_partial)
+        self.mode_group.addButton(self.radio_mode_hard_fixed)
+        self.radio_mode_partial.toggled.connect(self._update_enabled_state)
+        mode_layout.addWidget(self.radio_mode_partial)
+        mode_layout.addWidget(self.radio_mode_hard_fixed)
+        layout.addWidget(mode_group)
+
+        # --- Weighting ---
+        weight_group = QGroupBox("Weighting")
+        weight_layout = QFormLayout(weight_group)
+        weight_layout.setVerticalSpacing(8)
+
+        self.input_base_sigma = QLineEdit("1.0")
+        self.input_base_sigma.setValidator(QDoubleValidator(0.0, 1.0e9, 6))
+        self.input_base_sigma.setToolTip(
+            "Fallback absolute sigma (same units as G) for base stations "
+            "in Approach A, used only when the Base Station Reference "
+            "file doesn't give a Sigma for a station. Ignored in "
+            "Approach B."
+        )
+        weight_layout.addRow("Absolute Base Station Sigma:", self.input_base_sigma)
+
+        sigma_label = QLabel("Relative Ties (DeltaG) Sigma:")
+        weight_layout.addRow(sigma_label, None)
+
+        self.radio_sigma_manual = QRadioButton(
+            "Use a global manual sigma for all relative ties"
+        )
+        self.radio_sigma_meansigma = QRadioButton(
+            "Read propagated 'MeanSigma' from drift output"
+        )
+        self.radio_sigma_meansigma.setToolTip(
+            "Reads each visit's MeanSigma (standard error of the mean "
+            "reading, from Drift Correction) and uses it as that tie "
+            "observation's sigma. Requires the drift-corrected files to "
+            "contain the MeanSigma column (exported by 'Export for "
+            "Least Squares')."
+        )
+        self.radio_sigma_manual.setChecked(True)
+        self.sigma_source_group = QButtonGroup(self)
+        self.sigma_source_group.addButton(self.radio_sigma_manual)
+        self.sigma_source_group.addButton(self.radio_sigma_meansigma)
+        self.radio_sigma_manual.toggled.connect(self._update_enabled_state)
+        weight_layout.addRow("", self.radio_sigma_manual)
+
+        self.input_relative_sigma = QLineEdit("5.0")
+        self.input_relative_sigma.setValidator(QDoubleValidator(0.0, 1.0e9, 6))
+        self.input_relative_sigma.setToolTip(
+            "One sigma value applied to EVERY relative DeltaG tie "
+            "(same units as DeltaG)."
+        )
+        relative_sigma_row = QHBoxLayout()
+        relative_sigma_row.setContentsMargins(24, 0, 0, 0)
+        relative_sigma_row.addWidget(self.input_relative_sigma)
+        relative_sigma_row.addWidget(QLabel("(applied to every tie)"))
+        weight_layout.addRow("", relative_sigma_row)
+        weight_layout.addRow("", self.radio_sigma_meansigma)
+        layout.addWidget(weight_group)
+
+        # --- Buttons ---
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Run Adjustment")
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self._update_enabled_state()
+
+    def _update_enabled_state(self, *_args):
+        """Grey out inputs that don't apply to the current selections."""
+        self.input_base_sigma.setEnabled(self.radio_mode_partial.isChecked())
+        self.input_relative_sigma.setEnabled(self.radio_sigma_manual.isChecked())
+
+    def _on_accept(self):
+        """Validate the inputs, then accept and store the configuration."""
+        mode = (
+            self.MODE_PARTIAL
+            if self.radio_mode_partial.isChecked()
+            else self.MODE_HARD_FIXED
+        )
+        relative_sigma_source = (
+            self.SIGMA_SOURCE_MANUAL
+            if self.radio_sigma_manual.isChecked()
+            else self.SIGMA_SOURCE_MEANSIGMA
+        )
+
+        manual_base_sigma = 1.0
+        if mode == self.MODE_PARTIAL:
+            base_text = self.input_base_sigma.text().strip()
+            if not base_text:
+                QMessageBox.warning(
+                    self, "Missing Sigma",
+                    "Enter an absolute base station sigma (e.g. 1.0).",
+                )
+                return
+            try:
+                manual_base_sigma = float(base_text)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid Sigma", f"'{base_text}' is not a valid number."
+                )
+                return
+            if manual_base_sigma <= 0:
+                QMessageBox.warning(
+                    self, "Invalid Sigma",
+                    "Base station sigma must be greater than zero.",
+                )
+                return
+
+        manual_relative_sigma = None
+        if relative_sigma_source == self.SIGMA_SOURCE_MANUAL:
+            rel_text = self.input_relative_sigma.text().strip()
+            if not rel_text:
+                QMessageBox.warning(
+                    self, "Missing Sigma",
+                    "Enter a global sigma for the relative ties (e.g. 5.0).",
+                )
+                return
+            try:
+                manual_relative_sigma = float(rel_text)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid Sigma", f"'{rel_text}' is not a valid number."
+                )
+                return
+            if manual_relative_sigma <= 0:
+                QMessageBox.warning(
+                    self, "Invalid Sigma",
+                    "Global relative-tie sigma must be greater than zero.",
+                )
+                return
+
+        self._config = {
+            "mode": mode,
+            "relative_sigma_source": relative_sigma_source,
+            "manual_relative_sigma": manual_relative_sigma,
+            "manual_base_sigma": manual_base_sigma,
+        }
+        self.accept()
+
+    def get_config(self):
+        """Return the validated configuration dict (None if not accepted)."""
+        return self._config
 
 
 class MainWindow(QMainWindow):
@@ -124,6 +345,7 @@ class MainWindow(QMainWindow):
         self.adjusted_results = None   # will hold least-squares results (Phase 5/6)
         # Data loader (computation logic lives in core/, not here)
         self.least_squares_results = None  # Station/AdjustedGValue table (Phase 5)
+        self.least_squares_closure_checks = []  # hard-fixed mode diagnostics (Phase 5)
         self.data_loader = GravityDataLoader()
         self.drift_corrector = DriftCorrector(readings_per_visit=5)
 
@@ -1440,14 +1662,23 @@ class MainWindow(QMainWindow):
         """
         Slot for the 'Least Squares Adjustment' button.
 
-        Prompts for a batch of daily drift-corrected files (multi-
-        select, one dialog) plus a single Base Station Reference file,
-        then delegates matrix assembly and solving entirely to
-        core.adjustment.NetworkAdjustment. Per the file-based
-        architecture, nothing is read from in-memory state here (not
-        even self.drift_corrected_data) -- every file is read fresh
-        from disk.
+        Shows the LeastSquaresConfigDialog FIRST so the user picks the
+        weighting scheme (Approach A vs B, base-station sigma, and the
+        relative-tie sigma source) before any math runs. Then prompts
+        for a batch of daily drift-corrected files (multi-select, one
+        dialog) plus a single Base Station Reference file, and
+        delegates matrix assembly and solving entirely to
+        core.adjustment.NetworkAdjustment using those settings. Per
+        the file-based architecture, nothing is read from in-memory
+        state here (not even self.drift_corrected_data) -- every file
+        is read fresh from disk.
         """
+        config_dialog = LeastSquaresConfigDialog(self)
+        if config_dialog.exec() != QDialog.Accepted:
+            self.set_status("Least Squares Adjustment cancelled (no configuration chosen).")
+            return
+        config = config_dialog.get_config()
+
         day_file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Daily Drift-Corrected Files (select all that apply)",
@@ -1488,11 +1719,18 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            A, L, station_ids, sigma, obs_labels = self.network_adjustment.build_network(
-                daily_dataframes, base_station_df
+            A, L, sigma, station_ids, obs_labels, closure_checks = (
+                self.network_adjustment.build_network(
+                    daily_dataframes,
+                    base_station_df,
+                    mode=config["mode"],
+                    relative_sigma_source=config["relative_sigma_source"],
+                    manual_relative_sigma=config["manual_relative_sigma"],
+                    manual_base_sigma=config["manual_base_sigma"],
+                )
             )
-            results_df, residuals_df = self.network_adjustment.solve_unweighted(
-                A, L, station_ids, obs_labels
+            results_df, residuals_df = self.network_adjustment.solve(
+                A, L, sigma, station_ids, obs_labels
             )
         except AdjustmentError as exc:
             QMessageBox.critical(self, "Least Squares Adjustment Failed", str(exc))
@@ -1507,6 +1745,7 @@ class MainWindow(QMainWindow):
             return
 
         self.least_squares_results = results_df
+        self.least_squares_closure_checks = closure_checks
         # Reuse the existing self.adjusted_results slot (already wired
         # to the Residual Plot / Residual Histogram graphs) so those
         # graphs work immediately with real data, no extra plumbing.
@@ -1515,13 +1754,50 @@ class MainWindow(QMainWindow):
 
         self.main_tab_widget.setCurrentWidget(self.least_squares_tab_widget)
 
-        self.set_status(
-            f"Least Squares Adjustment complete: {len(station_ids)} station(s), "
+        mode_label = (
+            "Approach A (partial constraints, weighted)"
+            if config["mode"] == LeastSquaresConfigDialog.MODE_PARTIAL
+            else "Approach B (hard-fixed base stations)"
+        )
+        status_text = (
+            f"Least Squares Adjustment complete ({mode_label}): {len(station_ids)} station(s), "
             f"{len(obs_labels)} observation(s) from {len(day_file_paths)} day file(s)."
         )
+        if closure_checks:
+            status_text += (
+                f" {len(closure_checks)} closure check(s) recorded "
+                "(observations tying two fixed base stations)."
+            )
+        self.set_status(status_text)
+
+        if closure_checks:
+            self._show_closure_checks(closure_checks)
 
         self._refresh_graph("residual_plot")
         self._refresh_graph("residual_histogram")
+
+    def _show_closure_checks(self, closure_checks):
+        """
+        Surface hard-fixed-mode closure checks (observations whose BOTH
+        endpoints are fixed base stations -- they add no unknowns to
+        the solve, only a diagnostic discrepancy) in a message box.
+        """
+        lines = []
+        for check in closure_checks[:15]:
+            lines.append(
+                f"{check['label']}: observed {check['observed_delta_g']:.6f} vs "
+                f"implied {check['implied_delta_g']:.6f} "
+                f"(discrepancy {check['discrepancy']:.6f})"
+            )
+        if len(closure_checks) > 15:
+            lines.append(f"... and {len(closure_checks) - 15} more.")
+        QMessageBox.information(
+            self,
+            "Closure Checks (Both Endpoints Fixed)",
+            "These observations tie two fixed base stations together, so they "
+            "add no unknowns to the solve and are reported as diagnostics:\n\n"
+            + "\n".join(lines),
+        )
 
     def on_show_graph(self, graph_type: str):
         """
