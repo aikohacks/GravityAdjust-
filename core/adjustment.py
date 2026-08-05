@@ -47,11 +47,15 @@ RELATIVE TIE SIGMA: comes from one of two sources, chosen via
                             reading), and it round-trips through
                             reports.excel_export.export_drift_only, so
                             this source works with files exported from
-                            the current drift-correction step. If a day
-                            file is missing the column (or a visit's
-                            MeanSigma is blank), a clear AdjustmentError
-                            is raised rather than silently falling back
-                            to something else.
+                            the current drift-correction step. Each
+                            relative-tie observation connects two visit
+                            means, so its sigma is the rigorous error
+                            propagation of the two endpoints:
+                            sigma_dg = sqrt(sigma_from^2 + sigma_to^2).
+                            If a day file is missing the column (or an
+                            endpoint visit's MeanSigma is blank), a
+                            clear AdjustmentError is raised rather than
+                            silently falling back to something else.
 
 BASE STATION SIGMA (mode="partial" only): read per-row from the Base
 Station Reference file's Sigma column when present and not NaN;
@@ -361,18 +365,38 @@ class NetworkAdjustment:
                 relative_sigma_source, manual_relative_sigma, manual_base_sigma,
             )
 
-    def _relative_sigma_for_row(self, day_df, row_index, relative_sigma_source, manual_relative_sigma):
-        """Look up the sigma to use for the relative-tie observation at `row_index`."""
+    def _relative_sigma_for_row(self, day_df, from_index, to_index, relative_sigma_source, manual_relative_sigma):
+        """
+        Sigma for the relative-tie observation connecting the two
+        consecutive station visits at day_df rows `from_index` -> `to_index`.
+
+        - "manual": one global sigma (manual_relative_sigma) for every tie.
+        - "mean_sigma_column": the tie's sigma is the rigorous error
+          propagation of the two endpoint visits' MeanSigma (each the
+          standard error of that visit's mean reading, in mGal):
+
+                sigma_dg = sqrt(sigma_from^2 + sigma_to^2)
+
+          A DeltaG value is the difference of two visit means, so its
+          variance is the sum of the two endpoint variances.
+        """
         if relative_sigma_source == "manual":
             return manual_relative_sigma
-        value = day_df.iloc[row_index]["MeanSigma"]
-        if pd.isna(value):
-            raise AdjustmentError(
-                f"MeanSigma is missing (blank/NaN) for row {row_index} of a day file. "
-                "Every relative-tie observation needs a sigma value when "
-                "relative_sigma_source='mean_sigma_column'."
-            )
-        return float(value)
+
+        def _endpoint_sigma(row_index, endpoint_label):
+            value = day_df.iloc[row_index]["MeanSigma"]
+            if pd.isna(value):
+                raise AdjustmentError(
+                    f"MeanSigma is missing (blank/NaN) for {endpoint_label} "
+                    f"(row {row_index}) of a day file. Every relative-tie "
+                    "observation needs sigma values for BOTH endpoint visits "
+                    "when relative_sigma_source='mean_sigma_column'."
+                )
+            return float(value)
+
+        sigma_from = _endpoint_sigma(from_index, "the 'from' visit")
+        sigma_to = _endpoint_sigma(to_index, "the 'to' visit")
+        return float(np.sqrt(sigma_from ** 2 + sigma_to ** 2))
 
     def _build_network_partial(
         self, daily_dataframes, base_values, base_sigma,
@@ -409,7 +433,7 @@ class NetworkAdjustment:
                     continue
 
                 sigma_value = self._relative_sigma_for_row(
-                    day_df, i, relative_sigma_source, manual_relative_sigma
+                    day_df, i - 1, i, relative_sigma_source, manual_relative_sigma
                 )
 
                 row = np.zeros(num_stations)
@@ -499,7 +523,7 @@ class NetworkAdjustment:
                     continue
 
                 sigma_value = self._relative_sigma_for_row(
-                    day_df, i, relative_sigma_source, manual_relative_sigma
+                    day_df, i - 1, i, relative_sigma_source, manual_relative_sigma
                 )
 
                 row = np.zeros(num_stations)
