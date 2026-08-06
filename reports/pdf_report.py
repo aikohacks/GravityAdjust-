@@ -234,8 +234,13 @@ def _dataframe_to_table(dataframe, float_format="{:.4f}", time_column=None):
 
     Args:
         time_column: if given, that column's values are formatted via
-            core.drift.format_minutes_to_clock() (H:MM) instead of the
+            core.drift.format_minutes_to_clock() (HH:MM clock time) instead of the
             raw float, matching the app's own table display convention.
+
+    A column literally named "MeanTime" is ALWAYS formatted as HH:MM
+    clock time (even if time_column is not passed), so a drift-corrected
+    results table can never be rendered with raw minutes-past-midnight
+    values by accident.
     """
     columns = [str(c) for c in dataframe.columns]
     data = [columns]
@@ -244,7 +249,7 @@ def _dataframe_to_table(dataframe, float_format="{:.4f}", time_column=None):
         row_values = []
         for column_name in columns:
             value = row[column_name]
-            if column_name == time_column and isinstance(value, (int, float)):
+            if (column_name == time_column or column_name == "MeanTime") and isinstance(value, (int, float)):
                 row_values.append(format_minutes_to_clock(value))
             elif isinstance(value, float):
                 row_values.append(float_format.format(value))

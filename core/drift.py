@@ -1,55 +1,14 @@
 """
 core/drift.py
--------------
-Drift correction logic for the Gravity Adjustment Software.
+--------------
+Circuit drift correction logic for the Gravity Adjustment Software.
 
-Implements the "circuit drift" method as taught by the survey mentor:
-
-    1. Each station is visited and read one or more times in quick
-       succession (a "visit"). We take the mean time and mean reading
-       of each visit.
-    2. A "circuit" is a closed loop: it starts at a base station and
-       later returns to that same station (the station ID repeats).
-    3. Total drift over the circuit = first visit's mean reading minus
-       the closing (repeat) visit's mean reading.
-    4. Total time over the circuit = elapsed minutes between the first
-       and closing visit's mean times.
-    5. Drift rate = total drift / total time (drift per minute).
-    6. Each visit's own drift = drift rate * (elapsed minutes since the
-       first visit of the circuit).
-    7. Corrected reading = mean reading + that visit's drift.
-    8. Delta g between consecutive visits = (corrected[i] - corrected[i-1]) / 1000.
-    9. G value chains from a user-supplied known/absolute G value:
-       G[0] = known value; G[i] = G[i-1] + delta_g[i].
-
-This module contains NO GUI code -- it is pure computation, called from
-gui.py's drift-correction slot.
-
-IMPORTANT ASSUMPTIONS (confirmed with the user/mentor so far):
-    - A station "visit" is a contiguous run of one or more consecutive
-      rows sharing the same Station ID -- the number of sub-readings
-      per visit is NOT fixed (it can vary stop-to-stop), and the number
-      of station stops in a day's circuit is NOT fixed either -- a
-      circuit may be 5 stops, 7, 15, or any length. Visit boundaries
-      are detected by where the Station ID changes between consecutive
-      rows, not by a fixed block size.
-    - A circuit is detected by station IDs repeating (first visit's
-      station ID matches a later visit's station ID), not by an
-      explicit "loop/circuit ID" column.
-    - Time values are given as text like "1:36", meaning 1 hour and
-      36 minutes (H:MM clock format, NOT a decimal fraction of an
-      hour). The legacy "H.MM" dot-separated format (e.g. "1.36") is
-      still accepted for backward compatibility with older field data.
-    - The "known G value" is entered manually by the user (it comes
-      from an absolute gravimeter reading), not looked up from a table.
-    - The /1000 scale factor in delta-g is a fixed constant.
-    - Imported CSV/Excel headers may vary slightly in wording (e.g.
-      "Station ID" instead of "Station") -- these are normalized to
-      the canonical column names before processing (see COLUMN_ALIASES).
-
-These assumptions were derived from a single worked example and should
-be re-validated against real field data once available.
+See core/line_drift.py for the multi-day extension of this same method.
+This module contains NO GUI code -- it is pure computation.
 """
+
+import re
+import warnings
 
 import pandas as pd
 
@@ -57,6 +16,28 @@ import pandas as pd
 class DriftCorrectionError(Exception):
     """Raised when drift correction cannot be performed on the given data."""
     pass
+
+
+def format_minutes_to_clock(total_minutes: float) -> str:
+    """
+    Convert total minutes past midnight (e.g. 511.0) back into an
+    HH:MM clock-time display string (e.g. "08:31"), matching how the
+    time is recorded in the original field data sheets. Used for
+    display in the GUI and when exporting to Excel/PDF.
+
+    Values are minutes from midnight, wrapped modulo 24 hours (1440
+    min). The drift-unwrap step can push a visit past the 12:00 mark
+    (e.g. 13:00 -> 780 min); the 24-hour wrap keeps such times
+    displaying as "13:00" rather than "01:00".
+    """
+    wrapped = total_minutes % 1440
+    hours = int(wrapped // 60)
+    minutes = int(round(wrapped % 60))
+    if minutes == 60:
+        minutes = 0
+        hours += 1
+    hours %= 24  # rounding edge (e.g. 23:59:30 -> 24:00 -> 00:00)
+    return f"{hours:02d}:{minutes:02d}"
 
 
 class DriftCorrector:
@@ -68,45 +49,38 @@ class DriftCorrector:
         results_df = corrector.compute(raw_df, known_g_value=979.436285)
     """
 
-    # Column names expected in the raw observation DataFrame.
-    COL_STATION = "Station"
-    COL_TIME = "Time"
-    COL_READING = "Reading"
-
-    # Keyword-based header matching: a raw CSV/Excel header is mapped to
-    # a canonical column name if it contains one of these keywords as a
-    # whole word (case-insensitive, punctuation/underscores treated as
-    # word separators). This is deliberately fuzzy rather than an exact
-    # alias whitelist, so headers we didn't anticipate in advance (e.g.
-    # "Station No.", "STATION_ID", "Gravity Reading (mGal)") still match
-    # without needing a code change every time a new field-CSV format
-    # shows up. Order matters: canonical names earlier in this dict are
-    # checked first, so a header like "Reading Time" (which contains
-    # both "reading" and "time") resolves to Time, not Reading, because
-    # Time is checked before Reading.
     COLUMN_KEYWORDS = {
         "Station": ["station", "site"],
         "Time": ["time"],
         "Reading": ["reading", "gravity", "grav"],
     }
 
-    def __init__(self, readings_per_visit: int = None, reading_precision: int = 3, drift_precision: int = 3):
-        # readings_per_visit is kept only for backward-compatibility with
-        # existing call sites (e.g. gui.py's DriftCorrector(readings_per_visit=5))
-        # and is no longer used to determine visit boundaries -- visits
-        # are now detected dynamically by Station ID changing between
-        # consecutive rows (see _group_into_visits), since the number
-        # of sub-readings per stop and the number of stops per circuit
-        # both vary in real field data. It has no effect on computation.
-        self.readings_per_visit = readings_per_visit
-        # The mentor's worked example rounds the mean reading (and the
-        # drift applied to it) to the same decimal precision as the raw
-        # readings themselves before using them in further calculations
-        # -- it is NOT carried through in full floating-point precision.
-        # This matters: rounding here changes the final corrected reading
-        # by a small but real amount compared to using raw float means.
+    # Floor for the per-visit MeanSigma (standard error of the mean),
+    # expressed in milligals. MeanSigma is converted from raw reading
+    # (counter) units into mGal in _apply_drift_and_gvalue -- the same
+    # /1000.0 conversion applied to DeltaG -- so the Phase 5 weighting
+    # scheme uses consistent units (base-station Sigma values in the
+    # reference file are also mGal). A visit whose sub-readings are all
+    # identical has a sample std of 0, and a single-reading visit has no
+    # std at all -- either would become an infinite weight (1/sigma^2)
+    # in the weighted adjustment. Flooring at 0.01 microGal (1e-5 mGal)
+    # keeps such degenerate visits finite. The floor sits well below the
+    # repeatability of any real gravimeter (CG-5/CG-6: ~1-5 microGal =
+    # 1e-3..5e-3 mGal), so it never distorts genuine data -- it only
+    # caps the weight of degenerate zero-variance visits. The SVD-based
+    # solve in core.adjustment keeps even extreme weight ratios
+    # numerically safe. Overridable per instance via `min_sigma_mgal`.
+    MIN_SIGMA_MGAL = 1e-5
+
+    def __init__(self, reading_precision: int = 3, drift_precision: int = 3,
+                 readings_per_visit: int = None, min_sigma_mgal: float = None):
         self.reading_precision = reading_precision
         self.drift_precision = drift_precision
+        if min_sigma_mgal is not None:
+            self.MIN_SIGMA_MGAL = min_sigma_mgal
+        # readings_per_visit is accepted but unused -- kept only for
+        # backward compatibility with older call sites; visit grouping
+        # is dynamic (see _group_into_visits), not a fixed block size.
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -116,54 +90,52 @@ class DriftCorrector:
         Run the full drift-correction pipeline on raw observation data.
 
         Args:
-            raw_df: DataFrame with columns Station, Time, Reading (or
-                recognized aliases such as "Station ID") -- one row per
-                sub-reading. Consecutive rows sharing the same Station
-                ID form one "visit"; a visit can be any length (1 or
-                more rows), and a circuit (day's run) can contain any
-                number of visits.
-            known_g_value: absolute gravity value (mGal or gal, per your
-                convention) for the very first visit of the circuit,
-                entered manually by the surveyor. OPTIONAL -- pass None
-                to run drift correction without an absolute reference.
-                This is the "without known G value" mode: Drift,
-                CorrectedReading, and DeltaG are all computed exactly
-                the same way either way (none of them depend on an
-                absolute reference), but the GValue column is left as
-                None for every row instead of being chained from a
-                starting value. This mode is intended for feeding the
-                resulting relative DeltaG observations into a later
-                network adjustment (Phase 5), where absolute anchoring
-                comes from a separate base-station reference sheet
-                instead of from this file.
+            raw_df: raw observation rows (Station, Time, Reading, or
+                fuzzy-matched aliases like Site, StationID, Gravity Reading).
+            known_g_value: absolute gravity value for the first visit.
+                If None, the GValue column is RELATIVE ONLY -- it starts
+                at 0.0 and accumulates DeltaG from there, intended as raw
+                input to a downstream least-squares network adjustment
+                (Phase 5), which treats absolute base station values as
+                separate observations rather than requiring them here.
 
         Returns:
-            DataFrame with one row per station visit, columns:
-            Station, MeanTime (minutes), MeanReading, Drift,
-            CorrectedReading, DeltaG, GValue. GValue is None for every
-            row if known_g_value was None.
-
-        Raises:
-            DriftCorrectionError: if required columns are missing, or
-                if the data doesn't close into a circuit (first and
-                last station IDs don't match).
+            DataFrame with columns: Station, MeanTime, MeanReading,
+            Drift, CorrectedReading, DeltaG, GValue, MeanSigma.
+            MeanSigma is the standard error of the mean of that visit's
+            raw sub-readings -- an internal precision estimate used by
+            core.adjustment for weighted least squares (Phase B).
+            attrs["is_absolute"] indicates whether GValue is a true
+            absolute value or a relative-to-zero datum.
         """
-        raw_df = self._normalize_columns(raw_df)
-        self._validate_columns(raw_df)
+        df = self._normalize_columns(raw_df)
+        self._validate_columns(df)
+        self._validate_data_quality(df)
 
-        visits = self._group_into_visits(raw_df)
+        visits = self._group_into_visits(df)
         self._validate_circuit_closure(visits)
 
         visits = self._compute_mean_time_and_reading(visits)
+        for visit in visits:
+            if visit.get("outlier_count", 0):
+                warnings.warn(
+                    f"Station '{visit['station']}': {visit['outlier_count']} of "
+                    f"{len(visit['readings'])} sub-reading(s) flagged as outliers "
+                    f"(MAD > 3 sigma) and excluded from the visit mean."
+                )
         visits = self._unwrap_12hr_rollover(visits)
         total_time, total_drift, drift_rate = self._compute_circuit_drift_rate(visits)
 
-        results = self._apply_drift_and_gvalue(visits, drift_rate, known_g_value)
+        is_absolute = known_g_value is not None
+        seed_g_value = known_g_value if is_absolute else 0.0
+
+        results = self._apply_drift_and_gvalue(visits, drift_rate, seed_g_value)
 
         results.attrs["total_time_minutes"] = total_time
         results.attrs["total_drift"] = total_drift
         results.attrs["drift_rate_per_minute"] = drift_rate
-        results.attrs["known_g_value_provided"] = known_g_value is not None
+        results.attrs["is_absolute"] = is_absolute
+        results.attrs["drift_quality"] = self._compute_drift_quality(visits, drift_rate)
 
         return results
 
@@ -173,17 +145,10 @@ class DriftCorrector:
     @staticmethod
     def parse_time_to_minutes(time_value) -> float:
         """
-        Convert a time value like "1:36" (1 hour, 36 minutes) into total
-        minutes (96.0 in this example).
-
-        The convention here is H:MM -- clock hours and literal clock
-        minutes, NOT a decimal fraction of an hour. Minutes are assumed
-        to be given as two digits (e.g. "1:05" for 1:05, not "1:5"),
-        though a single digit is still accepted and zero-padded.
-
-        For backward compatibility with older field data recorded as
-        "H.MM" (dot separator, e.g. "1.36"), a "." is also accepted as
-        a separator if no ":" is present -- both mean the same thing.
+        Convert a time value into total minutes. Primary format is
+        H:MM (colon). H.MM (dot) is kept for backward compatibility --
+        the part after the separator is literal clock minutes, not a
+        decimal fraction of an hour.
         """
         text = str(time_value).strip()
 
@@ -214,108 +179,77 @@ class DriftCorrector:
         return hours * 60 + minutes
 
     # ------------------------------------------------------------------
-    # INTERNAL STEPS
+    # FUZZY HEADER MATCHING
     # ------------------------------------------------------------------
-    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Rename raw CSV/Excel headers to the canonical names ('Station',
-        'Time', 'Reading') this module expects, using fuzzy keyword
-        matching (see COLUMN_KEYWORDS) rather than an exact-match
-        whitelist. This means headers we didn't explicitly anticipate
-        -- different capitalization, punctuation, extra words like
-        "No." or units -- are still recognized as long as they contain
-        a relevant keyword as a whole word.
-
-        Exactly one raw column is mapped per canonical name (the first
-        match found, scanning left to right through the DataFrame's
-        columns). If a header could match multiple canonical names
-        (e.g. "Reading Time" contains both "reading" and "time"), the
-        canonical name checked earlier in COLUMN_KEYWORDS wins -- Time
-        is checked before Reading, so "Reading Time" resolves to Time.
-        """
-        already_mapped_raw_columns = set()
-        rename_map = {}
-
-        for canonical_name, keywords in self.COLUMN_KEYWORDS.items():
-            for col in df.columns:
-                if col in already_mapped_raw_columns:
-                    continue
-                if self._header_matches_keywords(col, keywords):
-                    rename_map[col] = canonical_name
-                    already_mapped_raw_columns.add(col)
-                    break  # only take the first matching raw column for this canonical name
-
-        return df.rename(columns=rename_map)
-
     @staticmethod
-    def _header_matches_keywords(header, keywords) -> bool:
-        """
-        True if `header` contains any of `keywords` as a whole word,
-        case-insensitively. Punctuation, underscores, and hyphens are
-        treated as word separators ("Station_ID", "Station-No.",
-        "STATION NO" all tokenize to include the word "station"), and
-        camelCase/concatenated headers are also split at lowercase-to-
-        uppercase transitions ("StationID" -> "Station ID") before
-        tokenizing, so no-separator headers are recognized too.
-        """
-        import re
-        text = str(header).strip()
-        text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)  # StationID -> Station ID
-        tokens = re.split(r"[^a-zA-Z0-9]+", text.lower())
-        tokens = [t for t in tokens if t]  # drop empty strings from split
+    def _tokenize_header(header: str):
+        """Split a header into lowercase word tokens (punctuation/underscore/camelCase aware)."""
+        spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", str(header))
+        spaced = re.sub(r"[^A-Za-z0-9]+", " ", spaced)
+        return [tok.lower() for tok in spaced.split() if tok]
+
+    @classmethod
+    def _header_matches_keywords(cls, header: str, keywords) -> bool:
+        tokens = cls._tokenize_header(header)
         return any(keyword in tokens for keyword in keywords)
 
+    @classmethod
+    def _header_matches_all_keywords(cls, header: str, keywords) -> bool:
+        """
+        True only if EVERY keyword token appears in the header (AND
+        semantics). Used for columns whose identity requires multiple
+        tokens, e.g. MeanSigma = "mean" AND "sigma" -- so a plain
+        "Sigma" column or a "MeanTime"/"MeanReading" header never
+        matches it.
+        """
+        tokens = cls._tokenize_header(header)
+        return all(keyword in tokens for keyword in keywords)
+
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        rename_map = {}
+        for canonical, keywords in self.COLUMN_KEYWORDS.items():
+            if canonical in df.columns:
+                continue
+            for col in df.columns:
+                if self._header_matches_keywords(col, keywords):
+                    rename_map[col] = canonical
+                    break
+        return df.rename(columns=rename_map)
+
     def _validate_columns(self, df: pd.DataFrame):
-        required = {self.COL_STATION, self.COL_TIME, self.COL_READING}
+        required = set(self.COLUMN_KEYWORDS.keys())
         missing = required - set(df.columns)
         if missing:
             raise DriftCorrectionError(
                 f"Missing required column(s) for drift correction: "
                 f"{', '.join(sorted(missing))}. "
-                f"Expected columns: {', '.join(sorted(required))}."
+                f"Expected columns matching: Station/Site, Time, "
+                f"Reading/Gravity."
             )
 
+    # ------------------------------------------------------------------
+    # VISIT GROUPING (dynamic block size)
+    # ------------------------------------------------------------------
     def _group_into_visits(self, df: pd.DataFrame):
         """
-        Split the raw rows into visits, where a visit is a contiguous
-        run of one or more consecutive rows that share the same
-        Station ID. This does NOT assume a fixed number of sub-readings
-        per visit, and does NOT assume a fixed number of visits per
-        circuit -- both vary in real field data (e.g. a day's circuit
-        might be 5 stops, 7 stops, or 15 stops before closing back on
-        the starting station).
-
-        Boundaries are detected purely by where the Station column
-        value changes between consecutive rows, preserving original
-        row order.
-
-        Example: Station column values
-            A A A B B B B C C A
-        produces 4 visits: [A,A,A], [B,B,B,B], [C,C], [A]
-        (the last single-row [A] visit is the closing repeat of the
-        base station).
+        Split rows into visits: contiguous runs of rows sharing the
+        same Station value, in original order. The number of
+        sub-readings per visit may vary freely.
         """
         if len(df) == 0:
             raise DriftCorrectionError("No observation data to process.")
 
-        station_series = df[self.COL_STATION].reset_index(drop=True)
-        time_series = df[self.COL_TIME].reset_index(drop=True)
-        reading_series = df[self.COL_READING].reset_index(drop=True)
-
-        # A new visit starts whenever the station value differs from
-        # the previous row's station value. cumsum() of that boolean
-        # gives each contiguous run a unique increasing group id.
-        visit_group_id = (station_series != station_series.shift()).cumsum()
+        station_series = df["Station"].reset_index(drop=True)
+        block_id = (station_series != station_series.shift()).cumsum()
 
         visits = []
-        for _, row_indices in station_series.groupby(visit_group_id).groups.items():
-            rows = list(row_indices)
+        for _, block in df.reset_index(drop=True).groupby(block_id):
             visits.append({
-                "station": station_series.iloc[rows[0]],
-                "times": [time_series.iloc[i] for i in rows],
-                "readings": [reading_series.iloc[i] for i in rows],
+                "station": block["Station"].iloc[0],
+                "times": block["Time"].tolist(),
+                "readings": block["Reading"].tolist(),
             })
-
         return visits
 
     def _validate_circuit_closure(self, visits):
@@ -325,68 +259,168 @@ class DriftCorrector:
                 "At least two station visits (start and closing repeat) "
                 "are required to compute circuit drift."
             )
-
-        first_station = visits[0]["station"]
-        last_station = visits[-1]["station"]
-
-        if first_station != last_station:
+        if visits[0]["station"] != visits[-1]["station"]:
             raise DriftCorrectionError(
                 f"The circuit does not close: the first visit is station "
-                f"'{first_station}' but the last visit is station "
-                f"'{last_station}'. Drift correction requires the survey "
-                f"to start and end at the same base station."
+                f"'{visits[0]['station']}' but the last visit is station "
+                f"'{visits[-1]['station']}'. Drift correction requires the "
+                f"survey to start and end at the same base station."
             )
 
+    def _detect_outliers(self, readings, threshold: float = 3.0):
+        """
+        Flag outlier sub-readings using the Median Absolute Deviation
+        (MAD) method -- robust to the outliers themselves, unlike
+        mean/std. A reading whose |z| = |x - median| / (1.4826 * MAD)
+        exceeds `threshold` is flagged as an outlier.
+
+        Returns a boolean mask aligned with `readings`. Degenerate
+        inputs (fewer than 3 readings, or MAD == 0 -- i.e. all readings
+        identical) never flag anything.
+        """
+        readings = pd.Series(readings, dtype=float)
+        n = len(readings)
+        if n < 3:
+            return pd.Series([False] * n, index=readings.index)
+        median = readings.median()
+        mad = (readings - median).abs().median()
+        if mad == 0:
+            return pd.Series([False] * n, index=readings.index)
+        z_scores = (readings - median) / (mad * 1.4826)
+        return z_scores.abs() > threshold
+
     def _compute_mean_time_and_reading(self, visits):
-        """Add mean time (in minutes) and mean reading to each visit dict."""
+        """
+        Add mean time (in minutes), mean reading, and reading_sigma to
+        each visit dict.
+
+        - Outlier sub-readings (MAD, 3-sigma) are excluded from the
+          visit mean and sigma so one bad reading cannot corrupt the
+          visit estimate. The number excluded is kept on the visit as
+          `outlier_count` for reporting.
+        - reading_sigma is the standard error of the mean of the CLEAN
+          sub-readings, in raw counter units (converted to mGal later
+          in _apply_drift_and_gvalue).
+        - Single-reading visits have no internal sigma estimate; they
+          inherit the circuit-wide AVERAGE reading_sigma from the
+          multi-reading visits (falling back to None -- and thus the
+          MIN_SIGMA_MGAL floor -- only if no visit in the circuit has
+          an estimate).
+        """
+        # First pass: per-visit mean, outlier rejection, and sigma.
         for visit in visits:
             minutes_list = [self.parse_time_to_minutes(t) for t in visit["times"]]
             visit["mean_time_minutes"] = sum(minutes_list) / len(minutes_list)
-            # Round to instrument precision, matching the mentor's manual
-            # method -- downstream drift math uses this rounded value,
-            # not the full-precision float mean.
-            raw_mean = sum(visit["readings"]) / len(visit["readings"])
+
+            readings = pd.Series(visit["readings"], dtype=float)
+            is_outlier = self._detect_outliers(readings)
+            visit["outlier_count"] = int(is_outlier.sum())
+
+            clean = readings[~is_outlier]
+            if len(clean) == 0:
+                # Every reading flagged (pathological data) -- fall back
+                # to the full set so we still produce an estimate, but
+                # record that nothing was excluded.
+                clean = readings
+                visit["outlier_count"] = 0
+
+            raw_mean = clean.mean()
             visit["mean_reading"] = round(raw_mean, self.reading_precision)
+
+            n = len(clean)
+            if n > 1:
+                std_dev = clean.std(ddof=1)
+                visit["reading_sigma"] = std_dev / (n ** 0.5)
+            else:
+                visit["reading_sigma"] = None
+
+        # Second pass: single-reading visits inherit the circuit-wide
+        # average sigma instead of masquerading as perfectly known.
+        computed = [v["reading_sigma"] for v in visits if v["reading_sigma"] is not None]
+        if computed:
+            circuit_avg_sigma = sum(computed) / len(computed)
+            for visit in visits:
+                if visit["reading_sigma"] is None:
+                    visit["reading_sigma"] = circuit_avg_sigma
         return visits
+
+    def _compute_drift_quality(self, visits, drift_rate):
+        """
+        Assess how well the linear drift model fits the observed
+        readings: R^2, RMS of residuals, max absolute residual, and the
+        number of visits used. The linear model is the first visit's
+        reading plus drift_rate * elapsed time.
+        """
+        first = visits[0]
+        predicted, actual = [], []
+        for visit in visits:
+            elapsed = visit["mean_time_minutes"] - first["mean_time_minutes"]
+            predicted.append(first["mean_reading"] + drift_rate * elapsed)
+            actual.append(visit["mean_reading"])
+
+        predicted = pd.Series(predicted, dtype=float)
+        actual = pd.Series(actual, dtype=float)
+        residuals = predicted - actual
+
+        rms_residual = float((residuals ** 2).mean() ** 0.5)
+        max_residual = float(residuals.abs().max())
+        ss_tot = float(((actual - actual.mean()) ** 2).sum())
+        ss_res = float((residuals ** 2).sum())
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        return {
+            "rms_residual": rms_residual,
+            "max_residual": max_residual,
+            "r_squared": r_squared,
+            "num_visits": len(visits),
+        }
+
+    def _validate_data_quality(self, df: pd.DataFrame):
+        """
+        Lightweight data-quality checks on the raw input. Currently
+        warns on negative raw readings, which are invalid for gravity
+        instruments and usually indicate a transcription error or a
+        swapped column.
+        """
+        reading_series = df["Reading"]
+        if (reading_series < 0).any():
+            count = int((reading_series < 0).sum())
+            warnings.warn(
+                f"Data quality: {count} negative Reading value(s) found. "
+                f"Gravity readings must be positive -- please check the data."
+            )
 
     def _unwrap_12hr_rollover(self, visits):
         """
-        Correct for 12-hour clock rollover across the circuit.
-
-        Field data is often recorded on a 12-hour clock (hours cycle
-        1-12, then wrap back to 1) with no AM/PM marker and no date
-        field. A circuit that runs long enough to cross that 12:00
-        boundary -- e.g. a visit at "12:38" followed later by a visit
-        at "01:03" -- means the clock wrapped forward, NOT that time
-        went backward. Without correction, that next visit's raw
-        mean_time_minutes would be smaller than the previous visit's,
-        which breaks every downstream elapsed-time calculation.
-
-        This walks the visits in order and adds 720 minutes (12 hours)
-        every time a visit's mean time is earlier than the previous
-        (already-corrected) visit's mean time, so mean_time_minutes
-        becomes monotonically non-decreasing across the whole circuit.
-        Handles multiple rollovers in a single circuit if the survey
-        runs long enough to wrap more than once.
+        Field data is on a 12-hour clock with no AM/PM marker. If a
+        circuit runs long enough to cross the 12:00 mark, later visits
+        will appear to have an earlier mean_time than previous visits.
+        This walks visits in order and adds 720 minutes whenever that
+        happens, making the whole circuit's timeline monotonic.
         """
-        offset = 0.0
-        previous_corrected_time = None
+        if not visits:
+            return visits
 
-        for visit in visits:
-            corrected_time = visit["mean_time_minutes"] + offset
-            while previous_corrected_time is not None and corrected_time < previous_corrected_time:
-                offset += 12 * 60
-                corrected_time = visit["mean_time_minutes"] + offset
-            visit["mean_time_minutes"] = corrected_time
-            previous_corrected_time = corrected_time
+        adjusted = [visits[0]["mean_time_minutes"]]
+        offset = 0
+        for i in range(1, len(visits)):
+            candidate = visits[i]["mean_time_minutes"] + offset
+            if candidate < adjusted[-1]:
+                # Candidate is still earlier than the previous visit
+                # even after the accumulated rollover offset -- it
+                # crossed the 12:00 mark again. Add enough 720-minute
+                # blocks to land after the previous visit, handling
+                # circuits that span multiple 12-hour crossings.
+                blocks = int((adjusted[-1] - candidate) // 720) + 1
+                offset += 720 * blocks
+                candidate = visits[i]["mean_time_minutes"] + offset
+            adjusted.append(candidate)
 
+        for visit, new_time in zip(visits, adjusted):
+            visit["mean_time_minutes"] = new_time
         return visits
 
     def _compute_circuit_drift_rate(self, visits):
-        """
-        Compute the circuit-level total time, total drift, and drift rate,
-        using the first and last (closing) visits.
-        """
         first_visit = visits[0]
         last_visit = visits[-1]
 
@@ -403,18 +437,11 @@ class DriftCorrector:
         return total_time, total_drift, drift_rate
 
     def _apply_drift_and_gvalue(self, visits, drift_rate, known_g_value):
-        """
-        Apply per-visit drift, corrected reading, and delta-g -- these
-        never depend on known_g_value. GValue is chained from
-        known_g_value if it was provided; if known_g_value is None
-        ("without known G value" mode), GValue is left as None for
-        every row, since there's nothing to chain from.
-        """
         first_visit = visits[0]
         rows = []
 
         previous_corrected = None
-        g_value = known_g_value  # None in "without known G" mode
+        g_value = known_g_value
 
         for visit in visits:
             elapsed = visit["mean_time_minutes"] - first_visit["mean_time_minutes"]
@@ -425,8 +452,20 @@ class DriftCorrector:
                 delta_g = 0.0
             else:
                 delta_g = (corrected_reading - previous_corrected) / 1000.0
-                if g_value is not None:
-                    g_value = g_value + delta_g
+                g_value = g_value + delta_g
+
+            # MeanSigma: this visit's standard error of the mean,
+            # converted from reading (counter) units to milligals -- the
+            # same /1000.0 conversion applied to DeltaG above -- so the
+            # weighting scheme in core.adjustment sees consistent units.
+            # Degenerate visits (identical sub-readings, or a single
+            # reading) get the MIN_SIGMA_MGAL floor instead of 0, which
+            # would otherwise produce an infinite weight (1/sigma^2).
+            raw_sigma = visit["reading_sigma"]
+            if raw_sigma is None or raw_sigma <= 0:
+                mean_sigma = self.MIN_SIGMA_MGAL
+            else:
+                mean_sigma = max(raw_sigma / 1000.0, self.MIN_SIGMA_MGAL)
 
             rows.append({
                 "Station": visit["station"],
@@ -436,28 +475,9 @@ class DriftCorrector:
                 "CorrectedReading": corrected_reading,
                 "DeltaG": delta_g,
                 "GValue": g_value,
+                "MeanSigma": mean_sigma,
             })
 
             previous_corrected = corrected_reading
 
         return pd.DataFrame(rows)
-
-
-def format_minutes_to_clock(total_minutes: float) -> str:
-    """
-    Inverse of DriftCorrector.parse_time_to_minutes(). Converts total
-    elapsed minutes back into 'H:MM' clock-style display string (colon
-    separates hours from literal clock minutes -- NOT a decimal point).
-
-    Used by the GUI (gui.py) for display purposes only -- all internal
-    drift/rate calculations continue to use the raw float-minutes value,
-    not this formatted string.
-
-    Example: 98.0 minutes -> "1:38"  (1 hour, 38 minutes)
-    """
-    hours = int(total_minutes // 60)
-    minutes = round(total_minutes % 60)
-    if minutes == 60:  # handles rounding edge case, e.g. 59.6 -> 60
-        hours += 1
-        minutes = 0
-    return f"{hours}:{minutes:02d}"

@@ -147,7 +147,13 @@ def export_drift_only(filepath: str, drift_corrected_data) -> None:
     sheet.title = "Drift Corrected Results"
 
     try:
-        _write_dataframe(sheet, drift_corrected_data, start_row=1, float_format="{:.6f}")
+        _write_dataframe(
+            sheet,
+            drift_corrected_data,
+            start_row=1,
+            float_format="{:.6f}",
+            time_column="MeanTime",
+        )
         workbook.save(filepath)
     except Exception as exc:
         raise ExcelExportError(f"Failed to write Excel file: {exc}") from exc
@@ -242,9 +248,15 @@ def _write_dataframe(sheet, dataframe, start_row, float_format="{:.4f}", time_co
 
     Args:
         time_column: if given, that column's values are formatted via
-            core.drift.format_minutes_to_clock() (H:MM) instead of the
-            raw float, matching the app's own results-table display
-            convention (populate_results_table() in gui.py).
+            core.drift.format_minutes_to_clock() (HH:MM clock time)
+            instead of the raw minutes-past-midnight float, matching
+            the app's own results-table display convention
+            (populate_results_table() in gui.py).
+
+    A column literally named "MeanTime" is ALWAYS formatted as HH:MM
+    clock time (even if time_column is not passed), so a drift-corrected
+    results table can never be written with raw minutes-past-midnight
+    values by accident.
     """
     columns = [str(c) for c in dataframe.columns]
 
@@ -266,7 +278,7 @@ def _write_dataframe(sheet, dataframe, start_row, float_format="{:.4f}", time_co
                 text = ""  # blank cell (e.g. GValue in 'Without Known G Value' mode) --
                            # left genuinely empty, not the string "None", so a later
                            # pandas.read_excel() reads it back as NaN naturally.
-            elif column_name == time_column and isinstance(value, (int, float)):
+            elif (column_name == time_column or column_name == "MeanTime") and isinstance(value, (int, float)):
                 text = format_minutes_to_clock(value)
             elif isinstance(value, float):
                 text = float_format.format(value)
