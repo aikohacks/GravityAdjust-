@@ -92,6 +92,12 @@ class LeastSquaresConfigDialog(QDialog):
         * "Use a global manual sigma for all relative ties": one
           sigma value (default 5.0) applied to every DeltaG
           observation (relative_sigma_source="manual").
+        * "Weight by elapsed time (drift-based)": each tie is weighted
+          inversely proportional to the time elapsed between its two
+          station visits (relative_sigma_source="time"). Drift -- the
+          dominant error source in gravity surveys -- accumulates
+          with time, so longer ties carry less weight. Uses the
+          MeanTime column from the drift-corrected files.
         * "Read propagated 'MeanSigma' from drift output": each tie's
           sigma is read from the MeanSigma column produced by
           core.drift.DriftCorrector.compute() and round-tripped
@@ -106,6 +112,7 @@ class LeastSquaresConfigDialog(QDialog):
     MODE_PARTIAL = "partial"
     MODE_HARD_FIXED = "hard_fixed"
     SIGMA_SOURCE_MANUAL = "manual"
+    SIGMA_SOURCE_TIME = "time"
     SIGMA_SOURCE_MEANSIGMA = "mean_sigma_column"
 
     def __init__(self, parent=None):
@@ -168,6 +175,17 @@ class LeastSquaresConfigDialog(QDialog):
         self.radio_sigma_manual = QRadioButton(
             "Use a global manual sigma for all relative ties"
         )
+        self.radio_sigma_time = QRadioButton(
+            "Weight by elapsed time (drift-based, P = 1/Δt)"
+        )
+        self.radio_sigma_time.setToolTip(
+            "Weights each DeltaG tie inversely proportional to the time "
+            "between its two station visits -- drift, the dominant error "
+            "source in gravity surveys, accumulates with time, so longer "
+            "ties carry less weight. Uses the MeanTime column from the "
+            "drift-corrected files (exported by 'Export for Least "
+            "Squares'). Zero time differences are safely floored."
+        )
         self.radio_sigma_meansigma = QRadioButton(
             "Read propagated 'MeanSigma' from drift output"
         )
@@ -181,6 +199,7 @@ class LeastSquaresConfigDialog(QDialog):
         self.radio_sigma_manual.setChecked(True)
         self.sigma_source_group = QButtonGroup(self)
         self.sigma_source_group.addButton(self.radio_sigma_manual)
+        self.sigma_source_group.addButton(self.radio_sigma_time)
         self.sigma_source_group.addButton(self.radio_sigma_meansigma)
         self.radio_sigma_manual.toggled.connect(self._update_enabled_state)
         weight_layout.addRow("", self.radio_sigma_manual)
@@ -196,6 +215,7 @@ class LeastSquaresConfigDialog(QDialog):
         relative_sigma_row.addWidget(self.input_relative_sigma)
         relative_sigma_row.addWidget(QLabel("(applied to every tie)"))
         weight_layout.addRow("", relative_sigma_row)
+        weight_layout.addRow("", self.radio_sigma_time)
         weight_layout.addRow("", self.radio_sigma_meansigma)
         layout.addWidget(weight_group)
 
@@ -220,11 +240,12 @@ class LeastSquaresConfigDialog(QDialog):
             if self.radio_mode_partial.isChecked()
             else self.MODE_HARD_FIXED
         )
-        relative_sigma_source = (
-            self.SIGMA_SOURCE_MANUAL
-            if self.radio_sigma_manual.isChecked()
-            else self.SIGMA_SOURCE_MEANSIGMA
-        )
+        if self.radio_sigma_manual.isChecked():
+            relative_sigma_source = self.SIGMA_SOURCE_MANUAL
+        elif self.radio_sigma_time.isChecked():
+            relative_sigma_source = self.SIGMA_SOURCE_TIME
+        else:
+            relative_sigma_source = self.SIGMA_SOURCE_MEANSIGMA
 
         manual_base_sigma = 1.0
         if mode == self.MODE_PARTIAL:

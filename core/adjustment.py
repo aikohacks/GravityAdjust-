@@ -36,10 +36,27 @@ to build_network():
 Both modes share the same weighted-least-squares solver:
     X = (A^T P A)^-1 A^T P L,   P = diag(1/sigma_i^2)
 
-RELATIVE TIE SIGMA: comes from one of two sources, chosen via
+RELATIVE TIE SIGMA: comes from one of THREE sources, chosen via
 `relative_sigma_source`:
     "manual"            -- a single sigma value (manual_relative_sigma)
                             applied to every relative-tie observation.
+    "time"              -- weight each tie inversely proportional to the
+                            elapsed time between its two station visits
+                            (P = 1/delta_t): drift accumulates with time,
+                            so a tie spanning a long time interval is
+                            less certain than a quick one. Implemented by
+                            setting sigma = sqrt(delta_t), which makes
+                            the solver's P = diag(1/sigma^2) equal
+                            diag(1/delta_t). The proportionality constant
+                            is absorbed by the a posteriori variance
+                            factor, so only the RELATIVE weights matter.
+                            Requires a MeanTime column (minutes from
+                            midnight, unwrapped across 12h rollovers --
+                            as produced by core.drift.DriftCorrector and
+                            exported via "Export for Least Squares").
+                            Zero time differences are floored at
+                            TIME_DELTA_FLOOR_MINUTES (1 minute) to avoid
+                            an infinite weight.
     "mean_sigma_column" -- read per-observation from a "MeanSigma"
                             column in each day's drift-corrected file.
                             core/drift.py produces this column (the
@@ -74,6 +91,44 @@ from core.drift import DriftCorrector
 class AdjustmentError(Exception):
     """Raised when the network adjustment cannot be built or solved."""
     pass
+
+
+def weight_matrix_from_time_differences(time_diffs, floor_minutes: float = 1.0):
+    """
+    Build the diagonal observation weight matrix P directly from the
+    elapsed-time differences between consecutive observations:
+
+        P = diag(1 / dt_i),   dt_i = |t_i - t_{i-1}|
+
+    Rationale (gravity surveys): instrument drift -- the dominant
+    error source -- accumulates with time, so an observation spanning
+    a longer time interval is less certain and must carry less weight.
+
+    Divide-by-zero handling: any dt_i <= floor_minutes (including
+    dt_i == 0, which happens when two consecutive visits are rounded
+    to the same clock minute) is replaced by `floor_minutes`, keeping
+    every weight finite.
+
+    Args:
+        time_diffs: array-like of elapsed-time differences per
+            observation, in minutes (e.g. numpy.diff of a "MeanTime"
+            column of total minutes past midnight).
+        floor_minutes: minimum elapsed time allowed (default 1.0 min).
+
+    Returns:
+        A 2D numpy diagonal matrix P with P[i, i] = 1 / max(|dt_i|,
+        floor_minutes).
+
+    Example:
+        >>> df = pd.DataFrame({"Station": ["A", "B", "C"],
+        ...                    "MeanTime": [480.0, 540.0, 555.0]})
+        >>> dt = np.abs(np.diff(df["MeanTime"].to_numpy()))  # [60., 15.]
+        >>> P = weight_matrix_from_time_differences(dt)
+    """
+    dt = np.asarray(time_diffs, dtype=float)
+    dt_safe = np.maximum(np.abs(dt), floor_minutes)
+    weights = 1.0 / dt_safe
+    return np.diag(weights)
 
 
 class NetworkAdjustment:
@@ -111,7 +166,21 @@ class NetworkAdjustment:
     MEAN_SIGMA_KEYWORDS = ["mean", "sigma"]
 
     VALID_MODES = ("partial", "hard_fixed")
-    VALID_RELATIVE_SIGMA_SOURCES = ("manual", "mean_sigma_column")
+    VALID_RELATIVE_SIGMA_SOURCES = ("manual", "time", "mean_sigma_column")
+
+    # Column name carrying each visit's mean time in minutes from
+    # midnight (unwrapped across 12-hour rollovers) -- the column
+    # used by relative_sigma_source="time".
+    TIME_COLUMN_NAME = "MeanTime"
+
+    # Floor (minutes) applied to the elapsed time between two
+    # consecutive visits when relative_sigma_source="time". Two
+    # visits rounded to the same minute give delta_t = 0, which would
+    # otherwise produce an infinite weight (1/0). 1 minute keeps the
+    # weight finite while sitting far below any real station-to-station
+    # travel time, so it never distorts genuine data -- it only caps
+    # the weight of zero-elapsed-time ties.
+    TIME_DELTA_FLOOR_MINUTES = 1.0
 
     # ------------------------------------------------------------------
     # STATION ID NORMALIZATION
@@ -344,6 +413,20 @@ class NetworkAdjustment:
                     "switch to relative_sigma_source='manual'."
                 )
 
+        if relative_sigma_source == "time":
+            missing_files = [
+                idx + 1 for idx, day_df in enumerate(daily_dataframes)
+                if self.TIME_COLUMN_NAME not in day_df.columns
+            ]
+            if missing_files:
+                raise AdjustmentError(
+                    "relative_sigma_source='time' was selected, but day file(s) "
+                    f"{missing_files} have no MeanTime column. Re-export the "
+                    "drift-corrected results from the drift-correction step "
+                    "(which produces MeanTime), or switch to another "
+                    "relative_sigma_source."
+                )
+
         # Base station known values / normalized IDs, needed regardless
         # of mode (used directly in "partial", used for substitution in
         # "hard_fixed").
@@ -371,6 +454,13 @@ class NetworkAdjustment:
         consecutive station visits at day_df rows `from_index` -> `to_index`.
 
         - "manual": one global sigma (manual_relative_sigma) for every tie.
+        - "time": sigma = sqrt(delta_t), where delta_t is the absolute
+          elapsed time (minutes) between the two endpoint visits' MeanTime
+          values, floored at TIME_DELTA_FLOOR_MINUTES. Because the solver
+          weights each observation as 1/sigma^2, this gives
+          P = 1/delta_t -- ties spanning a longer time interval carry
+          less weight, modelling drift uncertainty that accumulates with
+          time.
         - "mean_sigma_column": the tie's sigma is the rigorous error
           propagation of the two endpoint visits' MeanSigma (each the
           standard error of that visit's mean reading, in mGal):
@@ -382,6 +472,23 @@ class NetworkAdjustment:
         """
         if relative_sigma_source == "manual":
             return manual_relative_sigma
+
+        if relative_sigma_source == "time":
+            from_time = day_df.iloc[from_index][self.TIME_COLUMN_NAME]
+            to_time = day_df.iloc[to_index][self.TIME_COLUMN_NAME]
+            if pd.isna(from_time) or pd.isna(to_time):
+                raise AdjustmentError(
+                    "MeanTime is missing (blank/NaN) for a visit "
+                    f"(row {from_index} or {to_index}) of a day file. Every "
+                    "relative-tie observation needs MeanTime for BOTH endpoint "
+                    "visits when relative_sigma_source='time'."
+                )
+            # delta_t = 0 (two visits rounded to the same minute) is
+            # floored to TIME_DELTA_FLOOR_MINUTES, keeping the weight
+            # finite: weight = 1/sigma^2 = 1/delta_t.
+            delta_t = max(abs(float(to_time) - float(from_time)),
+                          self.TIME_DELTA_FLOOR_MINUTES)
+            return float(np.sqrt(delta_t))
 
         def _endpoint_sigma(row_index, endpoint_label):
             value = day_df.iloc[row_index]["MeanSigma"]
