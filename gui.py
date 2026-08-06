@@ -88,7 +88,16 @@ class LeastSquaresConfigDialog(QDialog):
           substituted out of the normal equations and never change.
           Relative ties still get weighted.
 
-      Relative Tie (DeltaG) Sigma
+      Weighting Mode (weighted toggle)
+        * "Weighted Least Squares (time-based, P = 1/Δt)": the default.
+          Each DeltaG observation is weighted inversely proportional to
+          the elapsed time between its two station visits
+          (config "weighted": True).
+        * "Unweighted Least Squares (P = I)": every observation is
+          treated equally -- all weights = 1, the classical unweighted
+          solution (config "weighted": False).
+
+      Relative Tie (DeltaG) Sigma (used when Weighted is selected)
         * "Use a global manual sigma for all relative ties": one
           sigma value (default 5.0) applied to every DeltaG
           observation (relative_sigma_source="manual").
@@ -106,7 +115,8 @@ class LeastSquaresConfigDialog(QDialog):
 
     get_config() returns a plain dict whose keys map 1:1 onto
     NetworkAdjustment.build_network()'s keyword arguments: mode,
-    relative_sigma_source, manual_relative_sigma, manual_base_sigma.
+    weighted, relative_sigma_source, manual_relative_sigma,
+    manual_base_sigma.
     """
 
     MODE_PARTIAL = "partial"
@@ -159,6 +169,37 @@ class LeastSquaresConfigDialog(QDialog):
         weight_layout = QFormLayout(weight_group)
         weight_layout.setVerticalSpacing(8)
 
+        self.radio_weighted = QRadioButton(
+            "Weighted Least Squares (time-based, P = 1/Δt)"
+        )
+        self.radio_weighted.setToolTip(
+            "Weights each DeltaG observation inversely proportional to "
+            "the elapsed time between its two station visits "
+            "(P_i = 1/Δt_i) -- instrument drift, the dominant error "
+            "source, accumulates with time. Uses the MeanTime column "
+            "from the drift-corrected files."
+        )
+        self.radio_unweighted = QRadioButton(
+            "Unweighted Least Squares (P = I, all weights equal)"
+        )
+        self.radio_unweighted.setToolTip(
+            "Treats every observation equally (weight = 1): the "
+            "classical unweighted least-squares solution. No sigma "
+            "columns are required."
+        )
+        self.radio_weighted.setChecked(True)
+        self.weighting_mode_group = QButtonGroup(self)
+        self.weighting_mode_group.addButton(self.radio_weighted)
+        self.weighting_mode_group.addButton(self.radio_unweighted)
+        self.radio_weighted.toggled.connect(self._update_enabled_state)
+        weighting_mode_widget = QWidget()
+        weighting_mode_layout = QVBoxLayout(weighting_mode_widget)
+        weighting_mode_layout.setContentsMargins(0, 0, 0, 0)
+        weighting_mode_layout.setSpacing(2)
+        weighting_mode_layout.addWidget(self.radio_weighted)
+        weighting_mode_layout.addWidget(self.radio_unweighted)
+        weight_layout.addRow("Weighting Mode:", weighting_mode_widget)
+
         self.input_base_sigma = QLineEdit("1.0")
         self.input_base_sigma.setValidator(QDoubleValidator(0.0, 1.0e9, 6))
         self.input_base_sigma.setToolTip(
@@ -196,7 +237,10 @@ class LeastSquaresConfigDialog(QDialog):
             "contain the MeanSigma column (exported by 'Export for "
             "Least Squares')."
         )
-        self.radio_sigma_manual.setChecked(True)
+        # Time-based weighting is the default weighted mode (matches the
+        # GUI's "Weighted Least Squares (time-based)" selection); manual
+        # and MeanSigma remain available as alternatives.
+        self.radio_sigma_time.setChecked(True)
         self.sigma_source_group = QButtonGroup(self)
         self.sigma_source_group.addButton(self.radio_sigma_manual)
         self.sigma_source_group.addButton(self.radio_sigma_time)
@@ -230,8 +274,17 @@ class LeastSquaresConfigDialog(QDialog):
 
     def _update_enabled_state(self, *_args):
         """Grey out inputs that don't apply to the current selections."""
-        self.input_base_sigma.setEnabled(self.radio_mode_partial.isChecked())
-        self.input_relative_sigma.setEnabled(self.radio_sigma_manual.isChecked())
+        weighted = self.radio_weighted.isChecked()
+        self.input_base_sigma.setEnabled(
+            weighted and self.radio_mode_partial.isChecked()
+        )
+        # Sigma-source options only matter in weighted mode.
+        self.radio_sigma_manual.setEnabled(weighted)
+        self.radio_sigma_time.setEnabled(weighted)
+        self.radio_sigma_meansigma.setEnabled(weighted)
+        self.input_relative_sigma.setEnabled(
+            weighted and self.radio_sigma_manual.isChecked()
+        )
 
     def _on_accept(self):
         """Validate the inputs, then accept and store the configuration."""
@@ -240,7 +293,12 @@ class LeastSquaresConfigDialog(QDialog):
             if self.radio_mode_partial.isChecked()
             else self.MODE_HARD_FIXED
         )
-        if self.radio_sigma_manual.isChecked():
+        weighted = self.radio_weighted.isChecked()
+        if not weighted:
+            # Unweighted: sigma is unused (P = I); keep the source
+            # value harmless.
+            relative_sigma_source = self.SIGMA_SOURCE_TIME
+        elif self.radio_sigma_manual.isChecked():
             relative_sigma_source = self.SIGMA_SOURCE_MANUAL
         elif self.radio_sigma_time.isChecked():
             relative_sigma_source = self.SIGMA_SOURCE_TIME
@@ -248,7 +306,7 @@ class LeastSquaresConfigDialog(QDialog):
             relative_sigma_source = self.SIGMA_SOURCE_MEANSIGMA
 
         manual_base_sigma = 1.0
-        if mode == self.MODE_PARTIAL:
+        if mode == self.MODE_PARTIAL and weighted:
             base_text = self.input_base_sigma.text().strip()
             if not base_text:
                 QMessageBox.warning(
@@ -295,6 +353,7 @@ class LeastSquaresConfigDialog(QDialog):
 
         self._config = {
             "mode": mode,
+            "weighted": weighted,
             "relative_sigma_source": relative_sigma_source,
             "manual_relative_sigma": manual_relative_sigma,
             "manual_base_sigma": manual_base_sigma,
@@ -1748,6 +1807,7 @@ class MainWindow(QMainWindow):
                     relative_sigma_source=config["relative_sigma_source"],
                     manual_relative_sigma=config["manual_relative_sigma"],
                     manual_base_sigma=config["manual_base_sigma"],
+                    weighted=config["weighted"],
                 )
             )
             results_df, residuals_df = self.network_adjustment.solve(
