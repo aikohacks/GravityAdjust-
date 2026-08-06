@@ -36,6 +36,18 @@ to build_network():
 Both modes share the same weighted-least-squares solver:
     X = (A^T P A)^-1 A^T P L,   P = diag(1/sigma_i^2)
 
+WEIGHTED / UNWEIGHTED TOGGLE
+----------------------------
+Every mode additionally accepts `weighted=True/False`:
+
+    weighted=True  (default) -- P = diag(1/sigma_i^2), with sigma per
+        relative_sigma_source (use "time" for time-based weights,
+        P_i = 1/delta_t_i).
+    weighted=False -- every observation gets sigma = 1, so
+        P = diag(1/1^2) = I -- the classical UNWEIGHTED least-squares
+        solution, exactly equivalent to solve_unweighted(). No sigma
+        columns (MeanTime/MeanSigma) are read in this mode.
+
 RELATIVE TIE SIGMA: comes from one of THREE sources, chosen via
 `relative_sigma_source`:
     "manual"            -- a single sigma value (manual_relative_sigma)
@@ -129,6 +141,46 @@ def weight_matrix_from_time_differences(time_diffs, floor_minutes: float = 1.0):
     dt_safe = np.maximum(np.abs(dt), floor_minutes)
     weights = 1.0 / dt_safe
     return np.diag(weights)
+
+
+def build_weight_matrix(sigma=None, n=None, weighted: bool = True):
+    """
+    Construct the diagonal observation weight matrix P for the selected
+    least-squares mode:
+
+        weighted=True  -> P = diag(1 / sigma_i^2)
+        weighted=False -> P = I  (n x n identity; all weights equal 1)
+
+    This is the explicit, inspectable form of the weight matrix the
+    solver builds implicitly (the solver uses sqrt(P) internally for
+    numerical stability, but the P matrix here is identical).
+
+    Args:
+        sigma: per-observation sigma array used when weighted=True
+            (e.g. sigma = sqrt(delta_t) for time-based weights).
+        n: number of observations, required when weighted=False
+            (the identity matrix size).
+        weighted: True for weighted LS, False for unweighted (P = I).
+
+    Returns:
+        A 2D numpy diagonal matrix P.
+
+    Example:
+        >>> P = build_weight_matrix(n=4, weighted=False)      # identity
+        >>> P = build_weight_matrix(sigma=[2.0, 1.0])         # diag(1/4, 1)
+    """
+    if not weighted:
+        if n is None:
+            raise ValueError("n (number of observations) is required when weighted=False.")
+        return np.eye(n)
+    if sigma is None:
+        raise ValueError("sigma is required when weighted=True.")
+    sigma = np.asarray(sigma, dtype=float)
+    if np.any(sigma <= 0):
+        raise ValueError(
+            "sigma must be strictly positive to build a valid weight matrix."
+        )
+    return np.diag(1.0 / (sigma ** 2))
 
 
 class NetworkAdjustment:
@@ -334,6 +386,7 @@ class NetworkAdjustment:
         daily_dataframes: list,
         base_station_df: pd.DataFrame,
         mode: str = "partial",
+        weighted: bool = True,
         relative_sigma_source: str = "manual",
         manual_relative_sigma: float = 5.0,
         manual_base_sigma: float = 1.0,
@@ -351,7 +404,13 @@ class NetworkAdjustment:
             base_station_df: DataFrame with "Station", "KnownG", "Sigma"
                 columns.
             mode: "partial" (Approach A) or "hard_fixed" (Approach B).
-            relative_sigma_source: "manual" or "mean_sigma_column" --
+            weighted: True (default) for weighted least squares -- sigma
+                comes from relative_sigma_source ("time" gives time-based
+                weights P_i = 1/delta_t_i). False for the UNWEIGHTED
+                solution: every observation gets sigma = 1, so P reduces
+                to the identity matrix, and no sigma columns are read.
+            relative_sigma_source: "manual", "time", or
+                "mean_sigma_column" --
                 where each relative-tie observation's sigma comes from.
             manual_relative_sigma: sigma applied to every relative-tie
                 observation when relative_sigma_source="manual".
@@ -399,7 +458,7 @@ class NetworkAdjustment:
                     "A zero or negative Sigma would produce an invalid (infinite) weight."
                 )
 
-        if relative_sigma_source == "mean_sigma_column":
+        if weighted and relative_sigma_source == "mean_sigma_column":
             missing_files = [
                 idx + 1 for idx, day_df in enumerate(daily_dataframes)
                 if "MeanSigma" not in day_df.columns
@@ -413,7 +472,7 @@ class NetworkAdjustment:
                     "switch to relative_sigma_source='manual'."
                 )
 
-        if relative_sigma_source == "time":
+        if weighted and relative_sigma_source == "time":
             missing_files = [
                 idx + 1 for idx, day_df in enumerate(daily_dataframes)
                 if self.TIME_COLUMN_NAME not in day_df.columns
@@ -440,19 +499,22 @@ class NetworkAdjustment:
         if mode == "hard_fixed":
             return self._build_network_hard_fixed(
                 daily_dataframes, base_values,
-                relative_sigma_source, manual_relative_sigma,
+                relative_sigma_source, manual_relative_sigma, weighted,
             )
         else:
             return self._build_network_partial(
                 daily_dataframes, base_values, base_sigma,
                 relative_sigma_source, manual_relative_sigma, manual_base_sigma,
+                weighted,
             )
 
-    def _relative_sigma_for_row(self, day_df, from_index, to_index, relative_sigma_source, manual_relative_sigma):
+    def _relative_sigma_for_row(self, day_df, from_index, to_index, relative_sigma_source, manual_relative_sigma, weighted=True):
         """
         Sigma for the relative-tie observation connecting the two
         consecutive station visits at day_df rows `from_index` -> `to_index`.
 
+        - weighted=False: sigma = 1.0 for every tie, so weight =
+          1/sigma^2 = 1 and P is the identity matrix (unweighted LS).
         - "manual": one global sigma (manual_relative_sigma) for every tie.
         - "time": sigma = sqrt(delta_t), where delta_t is the absolute
           elapsed time (minutes) between the two endpoint visits' MeanTime
@@ -470,6 +532,13 @@ class NetworkAdjustment:
           A DeltaG value is the difference of two visit means, so its
           variance is the sum of the two endpoint variances.
         """
+        if not weighted:
+            # Unweighted mode: sigma = 1 for every observation, so
+            # weight = 1/sigma^2 = 1 and P is the identity matrix.
+            # Return before touching any data column, so files don't
+            # need MeanTime/MeanSigma in this mode.
+            return 1.0
+
         if relative_sigma_source == "manual":
             return manual_relative_sigma
 
@@ -508,6 +577,7 @@ class NetworkAdjustment:
     def _build_network_partial(
         self, daily_dataframes, base_values, base_sigma,
         relative_sigma_source, manual_relative_sigma, manual_base_sigma,
+        weighted=True,
     ):
         """
         Approach A: base stations remain as unknowns in X, appearing
@@ -540,7 +610,8 @@ class NetworkAdjustment:
                     continue
 
                 sigma_value = self._relative_sigma_for_row(
-                    day_df, i - 1, i, relative_sigma_source, manual_relative_sigma
+                    day_df, i - 1, i, relative_sigma_source,
+                    manual_relative_sigma, weighted,
                 )
 
                 row = np.zeros(num_stations)
@@ -555,8 +626,13 @@ class NetworkAdjustment:
         for sid, known_g in base_values.items():
             row = np.zeros(num_stations)
             row[station_index[sid]] = 1.0
-            raw_sigma = base_sigma.get(sid)
-            sigma_value = manual_base_sigma if (raw_sigma is None or pd.isna(raw_sigma)) else float(raw_sigma)
+            if not weighted:
+                # Unweighted mode: base pseudo-observations are treated
+                # exactly like every other observation (weight = 1).
+                sigma_value = 1.0
+            else:
+                raw_sigma = base_sigma.get(sid)
+                sigma_value = manual_base_sigma if (raw_sigma is None or pd.isna(raw_sigma)) else float(raw_sigma)
 
             rows_A.append(row)
             rows_L.append(known_g)
@@ -574,7 +650,7 @@ class NetworkAdjustment:
 
     def _build_network_hard_fixed(
         self, daily_dataframes, base_values,
-        relative_sigma_source, manual_relative_sigma,
+        relative_sigma_source, manual_relative_sigma, weighted=True,
     ):
         """
         Approach B: base stations are eliminated from X entirely.
@@ -630,7 +706,8 @@ class NetworkAdjustment:
                     continue
 
                 sigma_value = self._relative_sigma_for_row(
-                    day_df, i - 1, i, relative_sigma_source, manual_relative_sigma
+                    day_df, i - 1, i, relative_sigma_source,
+                    manual_relative_sigma, weighted,
                 )
 
                 row = np.zeros(num_stations)
